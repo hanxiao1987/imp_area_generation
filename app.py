@@ -1,0 +1,1054 @@
+"""
+広告面板 視認エリア計算アプリ
+Plateau CityGML + 10次メッシュ LOS可視化
+"""
+import io
+import math
+import warnings
+import re
+import struct
+import zlib
+import urllib.request
+import json as _json
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import streamlit as st
+import plotly.graph_objects as go
+from shapely.geometry import Point, Polygon, LineString, box
+from pyproj import Transformer, CRS
+from lxml import etree
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 定数
+# ─────────────────────────────────────────────────────────────────────────────
+SECTOR_ANGLE_DEG         = 120.0
+EYE_HEIGHT_M             = 1.5
+SAMPLE_N                 = 5
+VISIBLE_RATIO_THRESHOLD  = 0.80
+LOS_TOLERANCE_M          = 0.1
+
+COLORS = [
+    "#e63946", "#2196f3", "#ff9800", "#4caf50",
+    "#9c27b0", "#00bcd4", "#f44336", "#8bc34a",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10次メッシュ エンコード (JIS X 0410, 15桁)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def encode_mesh10(lat: float, lon: float) -> str:
+    p = int(lat * 1.5)
+    q = int(lon - 100.0)
+    lat_rem = lat - p / 1.5
+    lon_rem = lon - (q + 100.0)
+    lat_sz, lon_sz = 2.0 / 3.0, 1.0
+    code = f"{p:02d}{q:02d}"
+
+    lat_sz /= 8; lon_sz /= 8
+    r2 = min(int(lat_rem / lat_sz), 7)
+    c2 = min(int(lon_rem / lon_sz), 7)
+    lat_rem -= r2 * lat_sz; lon_rem -= c2 * lon_sz
+    code += f"{r2}{c2}"
+
+    lat_sz /= 10; lon_sz /= 10
+    r3 = min(int(lat_rem / lat_sz), 9)
+    c3 = min(int(lon_rem / lon_sz), 9)
+    lat_rem -= r3 * lat_sz; lon_rem -= c3 * lon_sz
+    code += f"{r3}{c3}"
+
+    for _ in range(7):
+        lat_sz /= 2; lon_sz /= 2
+        eps = 1e-12
+        n = lat_rem >= lat_sz - eps
+        e = lon_rem >= lon_sz - eps
+        if n and e:    d = 4
+        elif n:        d = 3
+        elif e:        d = 2
+        else:          d = 1
+        if n: lat_rem -= lat_sz
+        if e: lon_rem -= lon_sz
+        code += str(d)
+
+    return code
+
+
+def mesh10_cell_size() -> tuple:
+    lat_sz = (2.0 / 3.0) / 8 / 10 / (2 ** 7)
+    lon_sz = 1.0 / 8 / 10 / (2 ** 7)
+    return lat_sz, lon_sz
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ジオメトリ補助
+# ─────────────────────────────────────────────────────────────────────────────
+
+def local_scale(lat: float):
+    return 111320.0, 111320.0 * math.cos(math.radians(lat))
+
+
+def create_sector(lat: float, lon: float, facing_deg: float,
+                  radius_m: float = 500.0) -> Polygon:
+    lat_sc, lon_sc = local_scale(lat)
+    half = SECTOR_ANGLE_DEG / 2.0
+    angles = np.linspace(facing_deg - half, facing_deg + half, 90)
+    coords = [(lon, lat)]
+    for az in angles:
+        math_rad = math.radians(90.0 - az)
+        dx = radius_m * math.cos(math_rad) / lon_sc
+        dy = radius_m * math.sin(math_rad) / lat_sc
+        coords.append((lon + dx, lat + dy))
+    coords.append((lon, lat))
+    return Polygon(coords)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CityGML パーサー
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GML_NS   = "http://www.opengis.net/gml"
+_BLDG_NS  = "http://www.opengis.net/citygml/building/1.0"
+_BLDG_NS2 = "http://www.opengis.net/citygml/building/2.0"
+
+
+def _detect_crs(root) -> str:
+    srs = root.get("srsName", "")
+    if not srs:
+        for el in root.iter():
+            srs = el.get("srsName", "")
+            if srs:
+                break
+
+    # OGC URI: http://www.opengis.net/def/crs/EPSG/0/6697
+    #          EPSG/VERSION/CODE → 末尾の数字がEPSGコード
+    m = re.search(r"EPSG/\d+/(\d+)", srs, re.IGNORECASE)
+    if m:
+        return f"EPSG:{m.group(1)}"
+
+    # URN: urn:ogc:def:crs:EPSG::6697 or urn:ogc:def:crs:EPSG:6.6:6697
+    m = re.search(r"crs:EPSG:[^:]*:(\d+)", srs, re.IGNORECASE)
+    if m:
+        return f"EPSG:{m.group(1)}"
+
+    # epsg.xml#NNNN 形式: http://www.opengis.net/gml/srs/epsg.xml#6697
+    m = re.search(r"epsg\.xml#(\d+)", srs, re.IGNORECASE)
+    if m:
+        return f"EPSG:{m.group(1)}"
+
+    # シンプル形式: EPSG:6697 (4桁以上を要求して EPSG:0 を回避)
+    m = re.search(r"EPSG[:/](\d{4,})", srs, re.IGNORECASE)
+    if m:
+        return f"EPSG:{m.group(1)}"
+
+    return "EPSG:6668"  # Plateau デフォルト (JGD2011)
+
+
+def _detect_swap_xy(src_crs: str) -> bool:
+    """
+    CRS の第1軸が緯度（北）かどうかを判定。
+    True → GML座標は (lat, lon) なので swap が必要。
+    """
+    try:
+        crs_obj = CRS(src_crs)
+        direction = crs_obj.axis_info[0].direction.lower()
+        return direction in ("north", "south")
+    except Exception:
+        epsg_match = re.search(r"(\d{4,5})$", src_crs)
+        if epsg_match:
+            epsg = int(epsg_match.group(1))
+            # 主要な地理座標系 (緯度先行) → swap 必要
+            return epsg in (4326, 6668, 6697, 4019, 4612)
+        return False
+
+
+def _parse_pos_list(text: str, dim: int = 3) -> list:
+    vals = [float(v) for v in text.split()]
+    return [tuple(vals[i:i+dim]) for i in range(0, len(vals) - dim + 1, dim)]
+
+
+def _polygon_from_pos_list(el, dim: int = 3, swap_xy: bool = False) -> Optional[Polygon]:
+    ns = _GML_NS
+    ring = el.find(f".//{{{ns}}}LinearRing")
+    if ring is None:
+        return None
+    pos_el = ring.find(f"{{{ns}}}posList")
+    if pos_el is None or not pos_el.text:
+        return None
+    pts = _parse_pos_list(pos_el.text, dim)
+    if len(pts) < 3:
+        return None
+    if swap_xy:
+        # (lat, lon, ...) → (lon, lat) for shapely
+        return Polygon([(p[1], p[0]) for p in pts])
+    return Polygon([(p[0], p[1]) for p in pts])
+
+
+def parse_citygml(file_bytes: bytes) -> gpd.GeoDataFrame:
+    """
+    Plateau CityGML から建物フットプリント (GeoDataFrame, WGS84) を生成。
+    座標軸順序を自動検出して正しく処理する。
+    """
+    root = etree.fromstring(file_bytes)
+    src_crs = _detect_crs(root)
+    swap_xy = _detect_swap_xy(src_crs)
+    to_wgs84 = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+
+    dim = 3
+    for el in root.iter(f"{{{_GML_NS}}}posList"):
+        sd = el.get("srsDimension")
+        if sd:
+            dim = int(sd)
+            break
+
+    bldg_ns = _BLDG_NS
+    buildings = root.findall(f".//{{{bldg_ns}}}Building")
+    if not buildings:
+        bldg_ns = _BLDG_NS2
+        buildings = root.findall(f".//{{{bldg_ns}}}Building")
+
+    rows = []
+    for bldg in buildings:
+        h_el = bldg.find(f".//{{{bldg_ns}}}measuredHeight")
+        height = float(h_el.text) if h_el is not None and h_el.text else 0.0
+
+        footprint = None
+
+        # lod0FootPrint 優先
+        fp_el = bldg.find(f".//{{{bldg_ns}}}lod0FootPrint")
+        if fp_el is not None:
+            poly_el = fp_el.find(f".//{{{_GML_NS}}}Polygon")
+            if poly_el is not None:
+                footprint = _polygon_from_pos_list(poly_el, dim=2, swap_xy=swap_xy)
+
+        # lod1Solid フォールバック
+        if footprint is None:
+            solid_el = bldg.find(f".//{{{bldg_ns}}}lod1Solid")
+            if solid_el is None:
+                solid_el = bldg.find(f".//{{{_GML_NS}}}Solid")
+            if solid_el is not None:
+                candidates = []
+                for poly_el in solid_el.findall(f".//{{{_GML_NS}}}Polygon"):
+                    pos_el = poly_el.find(f".//{{{_GML_NS}}}posList")
+                    if pos_el is None or not pos_el.text:
+                        continue
+                    pts = _parse_pos_list(pos_el.text, dim)
+                    if len(pts) < 3:
+                        continue
+                    z_idx = 2 if dim >= 3 else None
+                    z_vals = [p[z_idx] for p in pts] if z_idx is not None else [0]
+                    candidates.append((min(z_vals), pts))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    pts = candidates[0][1]
+                    if swap_xy:
+                        footprint = Polygon([(p[1], p[0]) for p in pts])
+                    else:
+                        footprint = Polygon([(p[0], p[1]) for p in pts])
+
+        if footprint is None or not footprint.is_valid or footprint.is_empty:
+            continue
+
+        try:
+            # footprint coords are (lon, lat) after swap_xy → pass as (x, y) to always_xy transformer
+            xcoords, ycoords = to_wgs84.transform(
+                [c[0] for c in footprint.exterior.coords],
+                [c[1] for c in footprint.exterior.coords],
+            )
+            footprint_wgs = Polygon(zip(xcoords, ycoords))
+            rows.append({"height": height, "geometry": footprint_wgs})
+        except Exception:
+            continue
+
+    if not rows:
+        return gpd.GeoDataFrame(columns=["height", "geometry"], crs="EPSG:4326")
+
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    gdf = gdf[gdf["height"] > 0].reset_index(drop=True)
+    return gdf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plateau 自動取得
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _fetch_plateau_catalog() -> dict:
+    """
+    geospatial.jp CKAN API から Plateau データセット一覧を取得。
+    Returns: {muniCd: dataset_id}  (同一市区町村は最新年度のみ保持)
+    """
+    catalog = {}
+    rows_per_page = 100
+    start = 0
+
+    while True:
+        url = (
+            f"https://www.geospatial.jp/ckan/api/3/action/package_search"
+            f"?fq=tags:PLATEAU&rows={rows_per_page}&start={start}"
+        )
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = _json.loads(r.read())
+
+        results = data["result"]["results"]
+        total   = data["result"]["count"]
+
+        for item in results:
+            name = item.get("name", "")
+            m = re.match(r"^plateau-(\d{5})-.*-(\d{4})$", name)
+            if m:
+                muni_cd = m.group(1)
+                year = int(m.group(2))
+                existing = catalog.get(muni_cd, "")
+                if not existing or int(existing.split("-")[-1]) < year:
+                    catalog[muni_cd] = name
+
+        start += rows_per_page
+        if start >= total:
+            break
+
+    return catalog
+
+
+def _gsi_reverse_geocode(lat: float, lon: float) -> Optional[str]:
+    """国土地理院 逆ジオコーダー API で緯度経度 → 市区町村コード"""
+    url = (f"https://mreversegeocoder.gsi.go.jp/reverse-geocoder/"
+           f"LonLatToAddress?lat={lat}&lon={lon}")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = _json.loads(r.read())
+        return data["results"]["muniCd"]
+    except Exception:
+        return None
+
+
+def _get_plateau_zip_url(dataset_id: str) -> Optional[str]:
+    """CKAN API で dataset_id → CityGML ZIP URL を取得 (v3 優先)"""
+    url = f"https://www.geospatial.jp/ckan/api/3/action/package_show?id={dataset_id}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = _json.loads(r.read())
+        resources = data["result"]["resources"]
+        # v3 を優先し、なければ最初の CityGML zip
+        v3_url = None
+        fallback_url = None
+        for res in resources:
+            name = res.get("name", "")
+            rurl = res.get("url", "")
+            if "CityGML" in name and rurl.endswith(".zip"):
+                if "v3" in name or "v3" in rurl:
+                    v3_url = rurl
+                elif fallback_url is None:
+                    fallback_url = rurl
+        return v3_url or fallback_url
+    except Exception:
+        return None
+
+
+def _read_zip_cd(zip_url: str) -> dict:
+    """
+    HTTP Range リクエストで ZIP セントラルディレクトリを読む。
+    Returns: {basename: (local_offset, comp_size, method)}
+    """
+    req = urllib.request.Request(zip_url, headers={"Range": "bytes=-65536"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        tail = r.read()
+
+    sig = b"PK\x05\x06"
+    pos = tail.rfind(sig)
+    if pos == -1:
+        raise ValueError("ZIP EOCD が見つかりません")
+
+    eocd = tail[pos:]
+    cd_size   = struct.unpack_from("<I", eocd, 12)[0]
+    cd_offset = struct.unpack_from("<I", eocd, 16)[0]
+
+    req2 = urllib.request.Request(
+        zip_url, headers={"Range": f"bytes={cd_offset}-{cd_offset+cd_size-1}"}
+    )
+    with urllib.request.urlopen(req2, timeout=30) as r:
+        cd_data = r.read()
+
+    files = {}
+    offset = 0
+    while offset + 46 <= len(cd_data):
+        if cd_data[offset:offset+4] != b"PK\x01\x02":
+            break
+        method      = struct.unpack_from("<H", cd_data, offset+10)[0]
+        comp_size   = struct.unpack_from("<I", cd_data, offset+20)[0]
+        fname_len   = struct.unpack_from("<H", cd_data, offset+28)[0]
+        extra_len   = struct.unpack_from("<H", cd_data, offset+30)[0]
+        comment_len = struct.unpack_from("<H", cd_data, offset+32)[0]
+        local_off   = struct.unpack_from("<I", cd_data, offset+42)[0]
+        fname = cd_data[offset+46:offset+46+fname_len].decode("utf-8", errors="replace")
+        if "bldg" in fname and fname.endswith(".gml"):
+            basename = fname.split("/")[-1]
+            files[basename] = (local_off, comp_size, method)
+        offset += 46 + fname_len + extra_len + comment_len
+
+    return files
+
+
+def _extract_gml_from_zip(zip_url: str, local_off: int,
+                           comp_size: int, method: int) -> bytes:
+    """ZIP から特定 GML ファイルを HTTP Range で抽出・解凍"""
+    lh_req = urllib.request.Request(
+        zip_url, headers={"Range": f"bytes={local_off}-{local_off+29}"}
+    )
+    with urllib.request.urlopen(lh_req, timeout=30) as r:
+        lh = r.read()
+    lh_fname_len = struct.unpack_from("<H", lh, 26)[0]
+    lh_extra_len = struct.unpack_from("<H", lh, 28)[0]
+    data_start = local_off + 30 + lh_fname_len + lh_extra_len
+
+    data_req = urllib.request.Request(
+        zip_url, headers={"Range": f"bytes={data_start}-{data_start+comp_size-1}"}
+    )
+    with urllib.request.urlopen(data_req, timeout=120) as r:
+        comp_data = r.read()
+
+    return zlib.decompress(comp_data, -15) if method == 8 else comp_data
+
+
+def get_needed_3rd_mesh_prefixes(billboards_df: pd.DataFrame) -> set:
+    """広告面板の扇形エリアに必要な 3 次メッシュコード（6 桁）セットを計算"""
+    lat_sz_3 = (2.0 / 3.0) / 8 / 10
+    lon_sz_3 = 1.0 / 8 / 10
+    prefixes = set()
+    for _, bb in billboards_df.iterrows():
+        sector = create_sector(bb.latitude, bb.longitude, bb.facing_deg, bb.max_range_m)
+        minlon, minlat, maxlon, maxlat = sector.bounds
+        la = math.floor(minlat / lat_sz_3) * lat_sz_3
+        while la <= maxlat:
+            lo = math.floor(minlon / lon_sz_3) * lon_sz_3
+            while lo <= maxlon:
+                if sector.intersects(box(lo, la, lo + lon_sz_3, la + lat_sz_3)):
+                    code = encode_mesh10(la + lat_sz_3 / 2, lo + lon_sz_3 / 2)
+                    prefixes.add(code[:6])
+                lo += lon_sz_3
+            la += lat_sz_3
+    return prefixes
+
+
+def auto_fetch_citygml(billboards_df: pd.DataFrame,
+                       log_box) -> Optional[gpd.GeoDataFrame]:
+    """
+    広告面板データから必要な Plateau CityGML を自動取得。
+    log_box: st.empty() コンテナ（ログ表示用）
+    """
+    logs = []
+
+    def log(msg: str):
+        logs.append(msg)
+        log_box.markdown("\n\n".join(logs))
+
+    # ① カタログ取得
+    log("📋 Plateau カタログを取得中...")
+    try:
+        catalog = _fetch_plateau_catalog()
+    except Exception as e:
+        log(f"❌ カタログ取得エラー: {e}")
+        return None
+    log(f"✅ カタログ取得完了（{len(catalog)} 市区町村がPlateau対応）")
+
+    # ② 逆ジオコーディング
+    log("📍 広告面板の市区町村を特定中...")
+    muni_cds = set()
+    for _, bb in billboards_df.iterrows():
+        muni_cd = _gsi_reverse_geocode(bb.latitude, bb.longitude)
+        if muni_cd:
+            muni_cds.add(muni_cd)
+    if not muni_cds:
+        log("❌ 市区町村コードを取得できませんでした（ネットワークを確認してください）")
+        return None
+    log(f"✅ 市区町村コード: {', '.join(sorted(muni_cds))}")
+
+    # ③ 必要な 3 次メッシュコードを計算
+    log("🗺️ 必要なメッシュタイルを計算中...")
+    needed_prefixes = get_needed_3rd_mesh_prefixes(billboards_df)
+    log(f"✅ 対象 3 次メッシュ: {', '.join(sorted(needed_prefixes))}（{len(needed_prefixes)} タイル）")
+
+    # ④ 各市区町村の GML を取得
+    all_gdfs = []
+    for muni_cd in sorted(muni_cds):
+        dataset_id = catalog.get(muni_cd)
+        if not dataset_id:
+            log(f"⚠️ 市区町村 {muni_cd} の Plateau データが見つかりません（対応エリア外の可能性）")
+            continue
+
+        log(f"🔍 `{dataset_id}` の ZIP URL を取得中...")
+        zip_url = _get_plateau_zip_url(dataset_id)
+        if not zip_url:
+            log(f"⚠️ `{dataset_id}` の ZIP URL が取得できませんでした")
+            continue
+
+        log(f"📦 ZIP インデックスを解析中（ファイル全体はダウンロードしません）...")
+        try:
+            cd = _read_zip_cd(zip_url)
+        except Exception as e:
+            log(f"❌ ZIP 解析エラー: {e}")
+            continue
+
+        needed = {
+            fname: info for fname, info in cd.items()
+            if any(fname.startswith(p) for p in needed_prefixes)
+        }
+
+        if not needed:
+            log(f"⚠️ 対象メッシュの GML が ZIP 内に見つかりませんでした")
+            continue
+
+        log(f"⬇️ {len(needed)} 個の GML ファイルをダウンロード中...")
+        for fname, (local_off, comp_size, method) in needed.items():
+            log(f"　　`{fname}` ({comp_size // 1024:,} KB 圧縮)...")
+            try:
+                gml_bytes = _extract_gml_from_zip(zip_url, local_off, comp_size, method)
+                gdf = parse_citygml(gml_bytes)
+                if not gdf.empty:
+                    all_gdfs.append(gdf)
+                    log(f"　　✅ `{fname}`: 建物 {len(gdf):,} 棟")
+                else:
+                    log(f"　　⚠️ `{fname}`: 建物データが空でした")
+            except Exception as e:
+                log(f"　　❌ `{fname}` 取得失敗: {e}")
+
+    if not all_gdfs:
+        log("❌ 建物データを取得できませんでした")
+        return None
+
+    combined = gpd.GeoDataFrame(
+        pd.concat(all_gdfs, ignore_index=True), crs="EPSG:4326"
+    )
+    log(f"\n✅ **取得完了: 建物 {len(combined):,} 棟**")
+    return combined
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOS 判定
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_blocked(src_lon, src_lat, src_h,
+                tgt_lon, tgt_lat, tgt_h,
+                candidates: gpd.GeoDataFrame,
+                lat_sc: float, lon_sc: float) -> bool:
+    dx_m = (tgt_lon - src_lon) * lon_sc
+    dy_m = (tgt_lat - src_lat) * lat_sc
+    D_m  = math.sqrt(dx_m ** 2 + dy_m ** 2)
+    if D_m < 1e-3:
+        return False
+
+    ray = LineString([(src_lon, src_lat), (tgt_lon, tgt_lat)])
+
+    for _, bldg in candidates.iterrows():
+        if not ray.intersects(bldg.geometry):
+            continue
+        inter = ray.intersection(bldg.geometry.boundary)
+        if inter.is_empty:
+            inter = ray.intersection(bldg.geometry)
+        if inter.is_empty:
+            continue
+
+        pts = list(inter.geoms) if hasattr(inter, "geoms") else [inter]
+        for ipt in pts:
+            if not hasattr(ipt, "x"):
+                continue
+            dx_b = (ipt.x - src_lon) * lon_sc
+            dy_b = (ipt.y - src_lat) * lat_sc
+            d_b  = math.sqrt(dx_b ** 2 + dy_b ** 2)
+            t    = min(d_b / D_m, 1.0)
+            if bldg["height"] > src_h * (1 - t) + tgt_h * t + LOS_TOLERANCE_M:
+                return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 視認計算
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
+                       progress_cb=None) -> tuple:
+    lat, lon  = bb["latitude"], bb["longitude"]
+    h         = bb["height_m"]
+    facing    = bb["facing_deg"]
+    radius    = bb.get("max_range_m", 500.0)
+    sid       = bb.get("screen_id", "B001")
+
+    sector = create_sector(lat, lon, facing, radius)
+    lat_sz, lon_sz = mesh10_cell_size()
+    lat_sc, lon_sc = local_scale(lat)
+
+    minlon, minlat, maxlon, maxlat = sector.bounds
+    start_lat = math.floor(minlat / lat_sz) * lat_sz
+    start_lon = math.floor(minlon / lon_sz) * lon_sz
+    all_lats  = np.arange(start_lat, maxlat + lat_sz, lat_sz)
+    all_lons  = np.arange(start_lon, maxlon + lon_sz, lon_sz)
+
+    mesh_boxes = [
+        {"lat": la + lat_sz/2, "lon": lo + lon_sz/2,
+         "box": box(lo, la, lo+lon_sz, la+lat_sz), "lat0": la, "lon0": lo}
+        for la in all_lats for lo in all_lons
+        if sector.intersects(box(lo, la, lo+lon_sz, la+lat_sz))
+    ]
+    total = len(mesh_boxes)
+    if total == 0:
+        return pd.DataFrame(), sector, 0
+
+    if buildings_gdf is not None and not buildings_gdf.empty:
+        bldgs  = buildings_gdf[buildings_gdf.geometry.intersects(sector.buffer(0.001))].copy()
+        sindex = bldgs.sindex if not bldgs.empty else None
+    else:
+        bldgs  = None
+        sindex = None
+
+    sample_offsets_lat = np.linspace(0.1, 0.9, SAMPLE_N) * lat_sz
+    sample_offsets_lon = np.linspace(0.1, 0.9, SAMPLE_N) * lon_sz
+
+    visible_rows = []
+    for i, m in enumerate(mesh_boxes):
+        if progress_cb and i % 20 == 0:
+            progress_cb(i / total, f"{sid}: LOS計算 {i}/{total}")
+
+        la0, lo0  = m["lat0"], m["lon0"]
+        clip = sector.intersection(m["box"])
+        if clip.is_empty:
+            continue
+
+        sample_pts = [
+            (lo0+dln, la0+dlt)
+            for dlt in sample_offsets_lat
+            for dln in sample_offsets_lon
+            if clip.contains(Point(lo0+dln, la0+dlt))
+        ]
+        if not sample_pts:
+            continue
+
+        n_visible = 0
+        for (slo, sla) in sample_pts:
+            if bldgs is not None and sindex is not None:
+                ray   = LineString([(lon, lat), (slo, sla)])
+                cands = bldgs.iloc[list(sindex.intersection(ray.bounds))]
+                blocked = _is_blocked(lon, lat, h, slo, sla, EYE_HEIGHT_M,
+                                      cands, lat_sc, lon_sc)
+            else:
+                blocked = False
+            if not blocked:
+                n_visible += 1
+
+        vis_ratio = n_visible / len(sample_pts)
+        if vis_ratio >= VISIBLE_RATIO_THRESHOLD:
+            code  = encode_mesh10(m["lat"], m["lon"])
+            dx_m  = (m["lon"] - lon) * lon_sc
+            dy_m  = (m["lat"] - lat) * lat_sc
+            dist_m = math.sqrt(dx_m**2 + dy_m**2)
+            visible_rows.append({
+                "billboard_id":  sid,
+                "mesh_code":     code,
+                "center_lat":    round(m["lat"], 8),
+                "center_lon":    round(m["lon"], 8),
+                "distance_m":    round(dist_m, 1),
+                "visible_ratio": round(vis_ratio, 3),
+            })
+
+    return pd.DataFrame(visible_rows), sector, total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 地図生成
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_map(billboards: list, sectors: list, visible_dfs: list,
+              buildings_gdf: Optional[gpd.GeoDataFrame]) -> go.Figure:
+    fig = go.Figure()
+
+    if buildings_gdf is not None and not buildings_gdf.empty:
+        # 建物を高さ5段階に分け各グループを1トレースに集約 (緑→赤グラデーション)
+        max_h = buildings_gdf["height"].quantile(0.95) or 1
+        bins  = [0, max_h*0.2, max_h*0.4, max_h*0.6, max_h*0.8, float("inf")]
+        tier_fill = [
+            "rgba(40,200,80,0.50)",    # 低  → 緑
+            "rgba(160,220,0,0.50)",    #     → 黄緑
+            "rgba(255,210,0,0.50)",    # 中  → 黄
+            "rgba(255,110,0,0.55)",    #     → オレンジ
+            "rgba(220,30,30,0.60)",    # 高  → 赤
+        ]
+        tier_line = [
+            "rgba(20,150,50,0.8)",
+            "rgba(100,170,0,0.8)",
+            "rgba(200,160,0,0.8)",
+            "rgba(200,70,0,0.8)",
+            "rgba(170,0,0,0.8)",
+        ]
+        labels = [
+            f"🟢 建物 〜{max_h*0.2:.0f}m（低）",
+            f"🟡 建物 〜{max_h*0.4:.0f}m",
+            f"🟡 建物 〜{max_h*0.6:.0f}m",
+            f"🟠 建物 〜{max_h*0.8:.0f}m",
+            f"🔴 建物 {max_h*0.8:.0f}m〜（高）",
+        ]
+
+        for tier in range(5):
+            lo_h, hi_h = bins[tier], bins[tier + 1]
+            subset = buildings_gdf[
+                (buildings_gdf["height"] > lo_h) & (buildings_gdf["height"] <= hi_h)
+            ]
+            if subset.empty:
+                continue
+
+            all_lons: list = []
+            all_lats: list = []
+            for geom in subset["geometry"]:
+                polys = list(geom.geoms) if geom.geom_type.startswith("Multi") else [geom]
+                for poly in polys:
+                    if poly.geom_type != "Polygon":
+                        continue
+                    xs, ys = poly.exterior.xy
+                    all_lons.extend(list(xs) + [None])
+                    all_lats.extend(list(ys) + [None])
+
+            if not all_lons:
+                continue
+
+            fig.add_trace(go.Scattermapbox(
+                lat=all_lats, lon=all_lons,
+                mode="lines", fill="toself",
+                fillcolor=tier_fill[tier],
+                line=dict(color=tier_line[tier], width=0.5),
+                name=labels[tier],
+                hoverinfo="skip",
+                showlegend=True,
+            ))
+
+    lat_sz, lon_sz = mesh10_cell_size()
+
+    for idx, (bb, sector, vdf) in enumerate(zip(billboards, sectors, visible_dfs)):
+        color = COLORS[idx % len(COLORS)]
+        sid   = bb.get("screen_id", f"B{idx+1}")
+
+        xs, ys = sector.exterior.xy
+        fig.add_trace(go.Scattermapbox(
+            lat=list(ys), lon=list(xs),
+            mode="lines", fill="toself",
+            fillcolor="rgba(255,220,0,0.08)",
+            line=dict(color=color, width=1.5),
+            name=f"{sid} 扇形エリア",
+            hoverinfo="skip",
+        ))
+
+        # 有効メッシュ: 中心点ではなく実寸のメッシュ矩形ポリゴンで描画
+        # 建物の緑〜赤と被らないよう青系の色を使用
+        if not vdf.empty:
+            box_lats: list = []
+            box_lons: list = []
+            box_texts: list = []
+            for _, row in vdf.iterrows():
+                la0 = row["center_lat"] - lat_sz / 2
+                lo0 = row["center_lon"] - lon_sz / 2
+                txt = (f"{row['mesh_code']}<br>"
+                       f"距離: {row['distance_m']}m<br>"
+                       f"可視率: {row['visible_ratio']*100:.1f}%")
+                # SW→SE→NE→NW→SW の順で閉じる
+                box_lats.extend([la0,          la0,          la0+lat_sz, la0+lat_sz, la0,          None])
+                box_lons.extend([lo0,          lo0+lon_sz,   lo0+lon_sz, lo0,        lo0,          None])
+                box_texts.extend([txt, txt, txt, txt, txt, ""])
+
+            fig.add_trace(go.Scattermapbox(
+                lat=box_lats, lon=box_lons,
+                mode="lines", fill="toself",
+                fillcolor="rgba(30,130,255,0.45)",
+                line=dict(color="rgba(0,70,210,0.85)", width=1),
+                name=f"🔵 {sid} 有効メッシュ ({len(vdf):,}件)",
+                text=box_texts,
+                hovertemplate="%{text}<extra></extra>",
+            ))
+
+        lat, lon = bb["latitude"], bb["longitude"]
+        facing   = bb["facing_deg"]
+        lat_sc, lon_sc = local_scale(lat)
+        arr_lat = lat + 40.0 * math.sin(math.radians(facing)) / lat_sc
+        arr_lon = lon + 40.0 * math.cos(math.radians(90.0 - facing)) / lon_sc
+
+        fig.add_trace(go.Scattermapbox(
+            lat=[lat, arr_lat], lon=[lon, arr_lon],
+            mode="lines", line=dict(color=color, width=4),
+            name=f"{sid} 面向方向", hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scattermapbox(
+            lat=[lat], lon=[lon],
+            mode="markers",
+            marker=dict(size=14, color=color, symbol="circle"),
+            name=f"{sid} ({bb['height_m']}m / {facing}°)",
+            hovertemplate=(f"<b>{sid}</b><br>高さ: {bb['height_m']}m<br>"
+                           f"方位: {facing}°<extra></extra>"),
+        ))
+
+    center_lat = np.mean([bb["latitude"]  for bb in billboards])
+    center_lon = np.mean([bb["longitude"] for bb in billboards])
+    fig.update_layout(
+        mapbox=dict(style="open-street-map",
+                    center=dict(lat=center_lat, lon=center_lon), zoom=16),
+        height=680,
+        margin=dict(r=0, t=0, l=0, b=0),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
+                    bgcolor="rgba(255,255,255,0.88)"),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="広告視認エリア計算", page_icon="👁️", layout="wide")
+st.title("👁️ 広告面板 視認エリア計算アプリ")
+st.caption("Plateau CityGML × 10次メッシュ LOS 解析")
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ データ入力")
+    st.divider()
+
+    # ① 広告面板 CSV
+    st.subheader("① 広告面板データ (CSV)")
+    st.markdown("""
+**必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`
+**任意列**: `max_range_m`（デフォルト 500m）
+
+**入力例**:
+```
+screen_id,latitude,longitude,height_m,facing_deg,max_range_m
+B001,35.6812,139.7671,15.0,180,500
+```
+""")
+    bb_file = st.file_uploader("CSVをアップロード", type=["csv"], key="bb_csv")
+
+    st.divider()
+
+    # ② 建物データ
+    st.subheader("② 建物データ（CityGML）")
+    bldg_mode = st.radio(
+        "取得方法",
+        ["🚀 Plateau から自動取得", "📂 手動アップロード", "⛔ 使用しない"],
+        help=(
+            "自動取得: 広告面板の位置から必要な建物データをネット経由で自動ダウンロード\n"
+            "手動: .gml ファイルをアップロード\n"
+            "使用しない: 建物遮蔽なし（扇形全体を視認エリアとして計算）"
+        ),
+    )
+
+    gml_file  = None
+    fetch_btn = False
+
+    if bldg_mode == "📂 手動アップロード":
+        gml_file = st.file_uploader(
+            "CityGML (.gml) をアップロード", type=["gml", "xml"], key="gml"
+        )
+    elif bldg_mode == "🚀 Plateau から自動取得":
+        st.caption(
+            "広告面板 CSV をアップロード後、ボタンで Plateau の建物データを自動ダウンロードします。"
+            "インターネット接続が必要です。"
+        )
+        fetch_btn = st.button(
+            "🏢 建物データを自動取得",
+            disabled=(bb_file is None),
+            use_container_width=True,
+            type="secondary",
+        )
+    else:
+        st.caption("建物遮蔽なしで計算します。扇形内のメッシュすべてが有効になります。")
+
+    st.divider()
+
+    # ③ 方位角ガイド
+    st.subheader("③ 方位角（facing_deg）の入力方法")
+    st.markdown("""
+| 方角 | 角度 |
+|------|------|
+| 北 (N) | **0°** |
+| 北東 (NE) | **45°** |
+| 東 (E) | **90°** |
+| 南東 (SE) | **135°** |
+| 南 (S) | **180°** |
+| 南西 (SW) | **225°** |
+| 西 (W) | **270°** |
+| 北西 (NW) | **315°** |
+
+> 地図上の**矢印**で方向を確認してください
+""")
+
+    st.divider()
+    run_btn = st.button(
+        "▶ 計算実行", type="primary", use_container_width=True,
+        disabled=(bb_file is None),
+    )
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+if bb_file is None:
+    st.info("👈 左のサイドバーから広告面板 CSV をアップロードしてください。")
+    st.stop()
+
+# CSV 読み込み
+try:
+    bb_df = pd.read_csv(bb_file)
+    required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg"}
+    missing  = required - set(bb_df.columns)
+    if missing:
+        st.error(f"CSV に必要な列がありません: {missing}")
+        st.stop()
+    if "max_range_m" not in bb_df.columns:
+        bb_df["max_range_m"] = 500.0
+    bb_df["max_range_m"] = bb_df["max_range_m"].fillna(500.0)
+except Exception as e:
+    st.error(f"CSV 読み込みエラー: {e}")
+    st.stop()
+
+st.success(f"広告面板 {len(bb_df)} 件を読み込みました")
+st.dataframe(bb_df, use_container_width=True)
+
+# 建物データ（手動アップロード）
+if gml_file is not None:
+    with st.spinner("CityGML を解析中..."):
+        try:
+            bldgs = parse_citygml(gml_file.read())
+            if bldgs.empty:
+                st.warning("CityGML から建物データを抽出できませんでした。")
+            else:
+                st.success(f"建物 {len(bldgs):,} 棟を読み込みました "
+                           f"（高さ平均 {bldgs['height'].mean():.1f}m）")
+                st.session_state["buildings_gdf"] = bldgs
+        except Exception as e:
+            st.error(f"CityGML 解析エラー: {e}")
+
+# 建物データ（自動取得）
+if fetch_btn:
+    st.subheader("🏢 建物データ自動取得ログ")
+    log_box = st.empty()
+    with st.spinner("Plateau から建物データを取得中..."):
+        bldgs = auto_fetch_citygml(bb_df, log_box)
+    if bldgs is not None:
+        st.session_state["buildings_gdf"] = bldgs
+        st.success(f"✅ 建物 {len(bldgs):,} 棟の取得が完了しました")
+    else:
+        st.error("建物データの自動取得に失敗しました。手動アップロードをお試しください。")
+
+# 建物データの状態表示
+buildings_gdf = st.session_state.get("buildings_gdf") if bldg_mode != "⛔ 使用しない" else None
+if bldg_mode == "🚀 Plateau から自動取得" and buildings_gdf is not None:
+    st.info(f"🏢 取得済み建物データ: {len(buildings_gdf):,} 棟（高さ平均 {buildings_gdf['height'].mean():.1f}m）")
+
+st.divider()
+
+# プレビューマップ
+st.subheader("📍 設定確認マップ（方向矢印を確認してください）")
+prev_fig = go.Figure()
+for idx, row in bb_df.iterrows():
+    color  = COLORS[idx % len(COLORS)]
+    sector = create_sector(row.latitude, row.longitude, row.facing_deg, row.max_range_m)
+    xs, ys = sector.exterior.xy
+    prev_fig.add_trace(go.Scattermapbox(
+        lat=list(ys), lon=list(xs), mode="lines", fill="toself",
+        fillcolor="rgba(255,200,0,0.10)", line=dict(color=color, width=1.5),
+        name=f"{row.screen_id} 扇形", hoverinfo="skip",
+    ))
+    lat_sc, lon_sc = local_scale(row.latitude)
+    arr_lat = row.latitude  + 40.0 * math.sin(math.radians(row.facing_deg)) / lat_sc
+    arr_lon = row.longitude + 40.0 * math.cos(math.radians(90.0 - row.facing_deg)) / lon_sc
+    prev_fig.add_trace(go.Scattermapbox(
+        lat=[row.latitude, arr_lat], lon=[row.longitude, arr_lon],
+        mode="lines", line=dict(color=color, width=4),
+        name=f"{row.screen_id} 方向矢印", hoverinfo="skip",
+    ))
+    prev_fig.add_trace(go.Scattermapbox(
+        lat=[row.latitude], lon=[row.longitude], mode="markers",
+        marker=dict(size=13, color=color),
+        name=str(row.screen_id),
+        hovertemplate=f"<b>{row.screen_id}</b><br>高さ: {row.height_m}m<br>方位: {row.facing_deg}°<extra></extra>",
+    ))
+
+center_lat = bb_df["latitude"].mean()
+center_lon = bb_df["longitude"].mean()
+prev_fig.update_layout(
+    mapbox=dict(style="open-street-map",
+                center=dict(lat=center_lat, lon=center_lon), zoom=16),
+    height=420, margin=dict(r=0, t=0, l=0, b=0),
+    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
+                bgcolor="rgba(255,255,255,0.88)"),
+)
+st.plotly_chart(prev_fig, use_container_width=True)
+st.caption("▲ 矢印が広告面板の面向方向です。「計算実行」の前に方向を確認してください。")
+
+# ── 計算実行 ─────────────────────────────────────────────────────────────────
+if run_btn:
+    prog_bar   = st.progress(0, text="計算を開始しています...")
+    all_visible = []
+    all_sectors = []
+
+    for i, row in bb_df.iterrows():
+        bb = row.to_dict()
+
+        def progress_cb(frac, text, _i=i):
+            prog_bar.progress((_i + frac) / len(bb_df), text=text)
+
+        vdf, sector, total = compute_visibility(bb, buildings_gdf, progress_cb)
+        all_visible.append(vdf)
+        all_sectors.append(sector)
+
+    prog_bar.progress(1.0, text="完了！")
+
+    result_df = (
+        pd.concat(all_visible, ignore_index=True)
+        if any(not v.empty for v in all_visible)
+        else pd.DataFrame()
+    )
+    st.session_state["result_df"]     = result_df
+    st.session_state["all_visible"]   = all_visible
+    st.session_state["all_sectors"]   = all_sectors
+    st.session_state["bb_list"]       = bb_df.to_dict("records")
+    st.session_state["buildings_calc"]= buildings_gdf
+
+# ── 結果表示 ─────────────────────────────────────────────────────────────────
+if "result_df" in st.session_state:
+    result_df     = st.session_state["result_df"]
+    all_visible   = st.session_state["all_visible"]
+    all_sectors   = st.session_state["all_sectors"]
+    bb_list       = st.session_state["bb_list"]
+    buildings_calc= st.session_state["buildings_calc"]
+
+    st.divider()
+    st.subheader("📊 計算結果")
+
+    cols = st.columns(max(len(bb_list), 1))
+    for idx, (bb, vdf) in enumerate(zip(bb_list, all_visible)):
+        with cols[idx % len(cols)]:
+            st.metric(
+                label=str(bb["screen_id"]),
+                value=f"{len(vdf):,} メッシュ",
+                help=f"方位 {bb['facing_deg']}° / 高さ {bb['height_m']}m / 範囲 {bb.get('max_range_m',500)}m",
+            )
+
+    if not result_df.empty:
+        st.dataframe(result_df, use_container_width=True, height=280)
+
+    st.divider()
+    st.subheader("🗺️ 視認エリアマップ")
+    st.caption("🟢→🔴 建物（低→高）　🔵 有効メッシュ矩形（可視率≥80%）　🟡 扇形エリア（120°）　→ 方向矢印")
+    with st.spinner("地図を生成中..."):
+        fig = build_map(bb_list, all_sectors, all_visible, buildings_calc)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    if not result_df.empty:
+        csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label="⬇️ 有効メッシュ CSV をダウンロード",
+            data=csv_bytes,
+            file_name="visible_meshes.csv",
+            mime="text/csv",
+            type="primary",
+        )
+    else:
+        st.warning("有効メッシュが 0 件でした。設定を見直してください。")
