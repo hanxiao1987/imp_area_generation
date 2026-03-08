@@ -803,6 +803,25 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="広告視認エリア計算", page_icon="👁️", layout="wide")
+
+# ── パスワード認証 ──────────────────────────────────────────────────────────
+def _check_password():
+    if st.session_state.get("authenticated"):
+        return
+    st.title("🔒 ログインが必要です")
+    st.caption("このアプリを利用するにはパスワードが必要です。")
+    pwd = st.text_input("パスワード", type="password", key="pwd_input")
+    if st.button("ログイン", type="primary"):
+        if pwd == st.secrets.get("APP_PASSWORD", ""):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います。")
+    st.stop()
+
+_check_password()
+# ── 認証済みユーザーのみここから表示 ────────────────────────────────────────
+
 st.title("👁️ 広告面板 視認エリア計算アプリ")
 st.caption("Plateau CityGML × 10次メッシュ LOS 解析")
 
