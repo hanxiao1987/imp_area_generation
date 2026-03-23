@@ -1346,29 +1346,6 @@ if "result_df" in st.session_state:
         fig = build_map(_fbb, _fsec, _fvis, buildings_calc, mesh_colors=_mcols)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-    st.subheader("⬇️ メッシュコード CSV ダウンロード（面別）")
-    st.caption("各ファイルはメッシュコードのみ・ヘッダーなし。ファイル名は Screen ID です。")
-    _dl_any = False
-    _dl_cols = st.columns(min(len(bb_list), 4))
-    for _i, (_bb, _vdf) in enumerate(zip(bb_list, all_visible)):
-        _sid = str(_bb["screen_id"])
-        if not _vdf.empty:
-            _dl_any = True
-            _mesh_csv = _vdf["mesh_code"].to_csv(index=False, header=False).encode("utf-8")
-            with _dl_cols[_i % min(len(bb_list), 4)]:
-                st.download_button(
-                    label=f"⬇️ {_sid}.csv ({len(_vdf):,}件)",
-                    data=_mesh_csv,
-                    file_name=f"{_sid}.csv",
-                    mime="text/csv",
-                    key=f"dl_{_sid}_{_i}",
-                    type="primary",
-                    use_container_width=True,
-                )
-    if not _dl_any:
-        st.warning("有効メッシュが 0 件でした。設定を見直してください。")
-
     # ── 視線遮蔽建物の除外補正 ────────────────────────────────────────────────
     st.divider()
     st.subheader("🚫 視線遮蔽建物の除外補正")
@@ -1522,3 +1499,27 @@ if "result_df" in st.session_state:
             st.session_state["all_sectors"]    = _new_sectors_r
             st.session_state["exclusion_mode"] = False
             st.rerun()
+
+    # ── メッシュコード CSV ダウンロード ───────────────────────────────────────
+    st.divider()
+    st.subheader("⬇️ メッシュコード CSV ダウンロード（面別）")
+    st.caption("各ファイルはメッシュコードのみ・ヘッダーなし。ファイル名は No.Screen ID です。")
+    _dl_any = False
+    _dl_cols = st.columns(min(len(bb_list), 4))
+    for _i, (_bb, _vdf) in enumerate(zip(bb_list, all_visible)):
+        _sid = str(_bb["screen_id"])
+        if not _vdf.empty:
+            _dl_any = True
+            _mesh_csv = _vdf["mesh_code"].to_csv(index=False, header=False).encode("utf-8")
+            with _dl_cols[_i % min(len(bb_list), 4)]:
+                st.download_button(
+                    label=f"⬇️ No.{_sid}.csv ({len(_vdf):,}件)",
+                    data=_mesh_csv,
+                    file_name=f"No.{_sid}.csv",
+                    mime="text/csv",
+                    key=f"dl_{_sid}_{_i}",
+                    type="primary",
+                    use_container_width=True,
+                )
+    if not _dl_any:
+        st.warning("有効メッシュが 0 件でした。設定を見直してください。")
