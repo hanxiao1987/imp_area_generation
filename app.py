@@ -427,7 +427,7 @@ def _extract_gml_from_zip(zip_url: str, local_off: int,
 
 
 def get_needed_3rd_mesh_prefixes(billboards_df: pd.DataFrame) -> set:
-    """広告面板の扇形エリアに必要な 3 次メッシュコード（6 桁）セットを計算"""
+    """広告面板の扇形エリアに必要な 3 次メッシュコード（8 桁）セットを計算"""
     lat_sz_3 = (2.0 / 3.0) / 8 / 10
     lon_sz_3 = 1.0 / 8 / 10
     prefixes = set()
@@ -440,7 +440,7 @@ def get_needed_3rd_mesh_prefixes(billboards_df: pd.DataFrame) -> set:
             while lo <= maxlon:
                 if sector.intersects(box(lo, la, lo + lon_sz_3, la + lat_sz_3)):
                     code = encode_mesh10(la + lat_sz_3 / 2, lo + lon_sz_3 / 2)
-                    prefixes.add(code[:6])
+                    prefixes.add(code[:8])
                 lo += lon_sz_3
             la += lat_sz_3
     return prefixes
