@@ -21,6 +21,13 @@ from shapely.geometry import Point, Polygon, LineString, box
 from pyproj import Transformer, CRS
 from lxml import etree
 
+try:
+    import folium
+    from streamlit_folium import st_folium
+    _FOLIUM_OK = True
+except ImportError:
+    _FOLIUM_OK = False
+
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1001,6 +1008,28 @@ else:
 st.success(f"広告面板 {len(bb_df)} 件を読み込みました")
 st.dataframe(bb_df, use_container_width=True)
 
+# ── 位置補正用: corrected_coords 初期化 (入力データが変わったらリセット) ──────
+_src_sig = bb_df[["screen_id", "latitude", "longitude"]].to_csv(index=False)
+if st.session_state.get("_corr_src") != _src_sig:
+    st.session_state["_corr_src"] = _src_sig
+    st.session_state["corrected_coords"] = {
+        str(r["screen_id"]): {"latitude": float(r["latitude"]),
+                               "longitude": float(r["longitude"])}
+        for _, r in bb_df.iterrows()
+    }
+    if "finalized_master" in st.session_state:
+        del st.session_state["finalized_master"]
+
+# 補正座標を適用した作業用 DataFrame
+_corr = st.session_state["corrected_coords"]
+bb_df_w = bb_df.copy()
+for _ci, _cr in bb_df_w.iterrows():
+    _csid = str(_cr["screen_id"])
+    if _csid in _corr:
+        bb_df_w.at[_ci, "latitude"]  = _corr[_csid]["latitude"]
+        bb_df_w.at[_ci, "longitude"] = _corr[_csid]["longitude"]
+bb_df_w["max_range_m"] = (bb_df_w["panel_h_m"] * bb_df_w["panel_w_m"] * 7).round(1)
+
 # 建物データ（手動アップロード）
 if gml_file is not None:
     with st.spinner("CityGML を解析中..."):
@@ -1020,7 +1049,7 @@ if fetch_btn:
     st.subheader("🏢 建物データ自動取得ログ")
     log_box = st.empty()
     with st.spinner("Plateau から建物データを取得中..."):
-        bldgs = auto_fetch_citygml(bb_df, log_box)
+        bldgs = auto_fetch_citygml(bb_df_w, log_box)
     if bldgs is not None:
         st.session_state["buildings_gdf"] = bldgs
         st.success(f"✅ 建物 {len(bldgs):,} 棟の取得が完了しました")
@@ -1037,7 +1066,7 @@ st.divider()
 # プレビューマップ
 st.subheader("📍 設定確認マップ（方向矢印を確認してください）")
 prev_fig = go.Figure()
-for idx, row in bb_df.iterrows():
+for idx, row in bb_df_w.iterrows():
     color  = COLORS[idx % len(COLORS)]
     sector = create_sector(row.latitude, row.longitude, row.facing_deg, row.max_range_m)
     # 有効扇形（デッドゾーン除外）
@@ -1072,8 +1101,8 @@ for idx, row in bb_df.iterrows():
         hovertemplate=f"<b>{row.screen_id}</b><br>高さ: {row.height_m}m<br>方位: {row.facing_deg}°<extra></extra>",
     ))
 
-center_lat = bb_df["latitude"].mean()
-center_lon = bb_df["longitude"].mean()
+center_lat = bb_df_w["latitude"].mean()
+center_lon = bb_df_w["longitude"].mean()
 prev_fig.update_layout(
     mapbox=dict(style="open-street-map",
                 center=dict(lat=center_lat, lon=center_lon), zoom=16),
@@ -1082,7 +1111,157 @@ prev_fig.update_layout(
                 bgcolor="rgba(255,255,255,0.88)"),
 )
 st.plotly_chart(prev_fig, use_container_width=True)
-st.caption("▲ 矢印が広告面板の面向方向です。「計算実行」の前に方向を確認してください。")
+st.caption("▲ 矢印が広告面板の面向方向です。下の補正マップで位置を調整し「最終確定」後に計算してください。")
+
+# ── 位置補正マップ ────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("✏️ 位置補正マップ")
+
+if not _FOLIUM_OK:
+    st.warning("folium / streamlit-folium が未インストールです。`pip install folium streamlit-folium` を実行してください。")
+else:
+    _sids_all = [str(r["screen_id"]) for _, r in bb_df_w.iterrows()]
+
+    _cc_map, _cc_ctrl = st.columns([3, 2])
+
+    with _cc_ctrl:
+        _sel = st.selectbox(
+            "移動する面を選択",
+            _sids_all,
+            key="corr_select",
+            help="選択した面のマーカーが赤くなります。地図上をクリックして新しい位置を指定してください。",
+        )
+
+    # Folium マップ構築
+    _fm = folium.Map(
+        location=[bb_df_w["latitude"].mean(), bb_df_w["longitude"].mean()],
+        zoom_start=16,
+        tiles="OpenStreetMap",
+    )
+    for _fi, _fr in bb_df_w.iterrows():
+        _fsid  = str(_fr["screen_id"])
+        _flat  = _corr[_fsid]["latitude"]
+        _flon  = _corr[_fsid]["longitude"]
+        _fcolor = "red" if _fsid == _sel else "blue"
+        # 扇形
+        _fsec  = create_sector(_flat, _flon, _fr["facing_deg"], _fr["max_range_m"])
+        folium.Polygon(
+            locations=[[p[1], p[0]] for p in _fsec.exterior.coords],
+            color=COLORS[_fi % len(COLORS)],
+            fill=True, fill_opacity=0.10, weight=2,
+            tooltip=f"{_fsid} 視認扇形",
+        ).add_to(_fm)
+        # マーカー
+        folium.Marker(
+            location=[_flat, _flon],
+            popup=_fsid,
+            tooltip=f"{_fsid}（{_flat:.5f}, {_flon:.5f}）",
+            icon=folium.Icon(color=_fcolor, icon="flag"),
+        ).add_to(_fm)
+
+    with _cc_map:
+        _map_res = st_folium(
+            _fm,
+            key="corr_folium",
+            height=430,
+            use_container_width=True,
+            returned_objects=["last_clicked"],
+        )
+
+    with _cc_ctrl:
+        _cur = _corr[_sel]
+        # 元データと比較して変更検知
+        _orig_row = bb_df[bb_df["screen_id"].astype(str) == _sel].iloc[0]
+        _is_moved = (
+            abs(_cur["latitude"]  - float(_orig_row["latitude"]))  > 1e-7 or
+            abs(_cur["longitude"] - float(_orig_row["longitude"])) > 1e-7
+        )
+        _status_icon = "✏️" if _is_moved else "📍"
+        st.markdown(
+            f"**{_status_icon} {_sel} 現在位置**  \n"
+            f"緯度: `{_cur['latitude']:.6f}`  \n"
+            f"経度: `{_cur['longitude']:.6f}`"
+        )
+
+        # クリック位置の処理
+        if _map_res and _map_res.get("last_clicked"):
+            _clk_lat = round(_map_res["last_clicked"]["lat"], 7)
+            _clk_lon = round(_map_res["last_clicked"]["lng"], 7)
+            _already = (
+                abs(_cur["latitude"]  - _clk_lat) < 1e-6 and
+                abs(_cur["longitude"] - _clk_lon) < 1e-6
+            )
+            if _already:
+                st.success(f"✓ この位置に移動済みです")
+            else:
+                st.info(
+                    f"🔵 **クリック位置**  \n"
+                    f"緯度: `{_clk_lat}`  \n"
+                    f"経度: `{_clk_lon}`"
+                )
+                if st.button(
+                    f"▶ {_sel} をこの位置に移動",
+                    key="apply_corr", type="secondary", use_container_width=True,
+                ):
+                    st.session_state["corrected_coords"][_sel] = {
+                        "latitude": _clk_lat, "longitude": _clk_lon,
+                    }
+                    if "finalized_master" in st.session_state:
+                        del st.session_state["finalized_master"]
+                    st.rerun()
+        else:
+            st.caption("地図上をクリックすると新しい位置を指定できます")
+
+        # 個別リセット
+        if _is_moved:
+            if st.button(f"↩ {_sel} の位置をリセット", key="reset_corr", use_container_width=True):
+                st.session_state["corrected_coords"][_sel] = {
+                    "latitude":  float(_orig_row["latitude"]),
+                    "longitude": float(_orig_row["longitude"]),
+                }
+                if "finalized_master" in st.session_state:
+                    del st.session_state["finalized_master"]
+                st.rerun()
+
+        st.divider()
+        st.markdown("**補正状況**")
+        for _ss, _sp in _corr.items():
+            _or = bb_df[bb_df["screen_id"].astype(str) == _ss].iloc[0]
+            _mv = (abs(_sp["latitude"]  - float(_or["latitude"]))  > 1e-7 or
+                   abs(_sp["longitude"] - float(_or["longitude"])) > 1e-7)
+            st.caption(f"{'✏️' if _mv else '📍'} **{_ss}**: {_sp['latitude']:.5f}, {_sp['longitude']:.5f}")
+
+# ── 最終確定 ──────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("✅ 最終確定")
+_fin_c1, _fin_c2 = st.columns([1, 1])
+
+with _fin_c1:
+    if st.button("✅ 位置を最終確定する", type="primary", key="finalize_btn", use_container_width=True):
+        _fdf = bb_df.copy()
+        for _fi2, _fr2 in _fdf.iterrows():
+            _fs = str(_fr2["screen_id"])
+            _fc = st.session_state.get("corrected_coords", {}).get(_fs)
+            if _fc:
+                _fdf.at[_fi2, "latitude"]  = _fc["latitude"]
+                _fdf.at[_fi2, "longitude"] = _fc["longitude"]
+        _fdf["max_range_m"] = (_fdf["panel_h_m"] * _fdf["panel_w_m"] * 7).round(1)
+        st.session_state["finalized_master"] = _fdf
+
+if "finalized_master" in st.session_state:
+    _fmdf = st.session_state["finalized_master"]
+    _out_cols = [c for c in ["screen_id", "latitude", "longitude", "height_m",
+                              "facing_deg", "panel_h_m", "panel_w_m"] if c in _fmdf.columns]
+    with _fin_c2:
+        _csv_out = _fmdf[_out_cols].to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ 補正後マスターCSVをダウンロード",
+            _csv_out, "corrected_master.csv", "text/csv",
+            type="primary", use_container_width=True,
+            key="dl_corrected_master",
+        )
+    st.success("✅ 確定済み。以下のデータで計算を実行します。")
+    st.dataframe(_fmdf[_out_cols], use_container_width=True)
 
 # ── 計算実行 ─────────────────────────────────────────────────────────────────
 if run_btn:
@@ -1090,11 +1269,11 @@ if run_btn:
     all_visible = []
     all_sectors = []
 
-    for i, row in bb_df.iterrows():
+    for i, row in bb_df_w.iterrows():
         bb = row.to_dict()
 
         def progress_cb(frac, text, _i=i):
-            prog_bar.progress((_i + frac) / len(bb_df), text=text)
+            prog_bar.progress((_i + frac) / len(bb_df_w), text=text)
 
         vdf, sector, total = compute_visibility(bb, buildings_gdf, progress_cb)
         all_visible.append(vdf)
@@ -1110,7 +1289,7 @@ if run_btn:
     st.session_state["result_df"]     = result_df
     st.session_state["all_visible"]   = all_visible
     st.session_state["all_sectors"]   = all_sectors
-    st.session_state["bb_list"]       = bb_df.to_dict("records")
+    st.session_state["bb_list"]       = bb_df_w.to_dict("records")
     st.session_state["buildings_calc"]= buildings_gdf
 
 # ── 結果表示 ─────────────────────────────────────────────────────────────────

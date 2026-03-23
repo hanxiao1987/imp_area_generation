@@ -7,3 +7,5 @@ plotly>=5.24.0
 pyproj>=3.6.0
 lxml>=5.0.0
 pyarrow>=14.0.0
+folium>=0.17.0
+streamlit-folium>=0.21.0
