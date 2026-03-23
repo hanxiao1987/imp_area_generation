@@ -37,6 +37,12 @@ COLORS = [
     "#9c27b0", "#00bcd4", "#f44336", "#8bc34a",
 ]
 
+
+def _hex_to_rgba(hex_color: str, alpha: float = 0.45) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 10次メッシュ エンコード (JIS X 0410, 15桁)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -669,7 +675,8 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_map(billboards: list, sectors: list, visible_dfs: list,
-              buildings_gdf: Optional[gpd.GeoDataFrame]) -> go.Figure:
+              buildings_gdf: Optional[gpd.GeoDataFrame],
+              mesh_colors: Optional[dict] = None) -> go.Figure:
     fig = go.Figure()
 
     if buildings_gdf is not None and not buildings_gdf.empty:
@@ -763,12 +770,15 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                 box_lons.extend([lo0,          lo0+lon_sz,   lo0+lon_sz, lo0,        lo0,          None])
                 box_texts.extend([txt, txt, txt, txt, txt, ""])
 
+            _mc = mesh_colors.get(sid) if mesh_colors else None
+            _fc = _hex_to_rgba(_mc, 0.45) if _mc else "rgba(30,130,255,0.45)"
+            _lc = _hex_to_rgba(_mc, 0.85) if _mc else "rgba(0,70,210,0.85)"
             fig.add_trace(go.Scattermapbox(
                 lat=box_lats, lon=box_lons,
                 mode="lines", fill="toself",
-                fillcolor="rgba(30,130,255,0.45)",
-                line=dict(color="rgba(0,70,210,0.85)", width=1),
-                name=f"🔵 {sid} 有効メッシュ ({len(vdf):,}件)",
+                fillcolor=_fc,
+                line=dict(color=_lc, width=1),
+                name=f"● {sid} 有効メッシュ ({len(vdf):,}件)",
                 text=box_texts,
                 hovertemplate="%{text}<extra></extra>",
             ))
@@ -839,19 +849,62 @@ with st.sidebar:
     st.header("⚙️ データ入力")
     st.divider()
 
-    # ① 広告面板 CSV
-    st.subheader("① 広告面板データ (CSV)")
-    st.markdown("""
+    # ① 広告面板データ
+    st.subheader("① 広告面板データ")
+    bb_input_mode = st.radio(
+        "入力方法",
+        ["📂 CSVアップロード", "✏️ 手入力（1面のみ）"],
+        key="bb_input_mode",
+        horizontal=True,
+    )
+
+    bb_file   = None
+    manual_bb = None
+
+    if bb_input_mode == "📂 CSVアップロード":
+        st.markdown("""
 **必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`
 **任意列**: `max_range_m`（デフォルト 500m）
-
-**入力例**:
-```
-screen_id,latitude,longitude,height_m,facing_deg,max_range_m
-B001,35.6812,139.7671,15.0,180,500
-```
 """)
-    bb_file = st.file_uploader("CSVをアップロード", type=["csv"], key="bb_csv")
+        bb_file = st.file_uploader("CSVをアップロード", type=["csv"], key="bb_csv")
+    else:
+        st.caption("最大1面の情報を入力してください。Screen IDは6桁の番号（例: 000001）にしてください。")
+        with st.form("manual_bb_form"):
+            sid_raw = st.text_input("Screen ID（6桁）", placeholder="例: 000001")
+            m_lat   = st.number_input("緯度 latitude",           value=35.6812,  format="%.6f")
+            m_lon   = st.number_input("経度 longitude",          value=139.7671, format="%.6f")
+            m_h     = st.number_input("高さ height_m (m)",       value=10.0,  min_value=0.1,  step=0.5)
+            m_f     = st.number_input("面向角度 facing_deg (°)", value=180.0, min_value=0.0,  max_value=359.9, step=1.0)
+            m_r     = st.number_input("最大視認距離 max_range_m (m)", value=500.0, min_value=10.0, step=10.0)
+            submitted = st.form_submit_button("✅ 設定を反映", use_container_width=True)
+
+        if submitted:
+            sid_clean = str(sid_raw).strip()
+            if len(sid_clean) == 0:
+                st.warning("⚠️ Screen IDを入力してください。")
+            elif len(sid_clean) < 6:
+                st.warning(
+                    f"⚠️ Screen IDは6桁にしてください。"
+                    f"「**{sid_clean.zfill(6)}**」のように頭に0を付けて入力してください。"
+                )
+            else:
+                st.session_state["manual_bb"] = {
+                    "screen_id":   sid_clean,
+                    "latitude":    m_lat,
+                    "longitude":   m_lon,
+                    "height_m":    m_h,
+                    "facing_deg":  m_f,
+                    "max_range_m": m_r,
+                }
+
+        if st.session_state.get("manual_bb"):
+            manual_bb = st.session_state["manual_bb"]
+            d = manual_bb
+            st.success(
+                f"✅ **{d['screen_id']}** 設定済み  \n"
+                f"緯度 {d['latitude']:.5f} / 経度 {d['longitude']:.5f}  \n"
+                f"高さ {d['height_m']}m｜方位 {d['facing_deg']}°｜範囲 {d['max_range_m']}m"
+            )
 
     st.divider()
 
@@ -881,7 +934,7 @@ B001,35.6812,139.7671,15.0,180,500
         )
         fetch_btn = st.button(
             "🏢 建物データを自動取得",
-            disabled=(bb_file is None),
+            disabled=(bb_file is None and not manual_bb),
             use_container_width=True,
             type="secondary",
         )
@@ -908,31 +961,38 @@ B001,35.6812,139.7671,15.0,180,500
 """)
 
     st.divider()
+    _has_input = (bb_file is not None) or bool(manual_bb)
     run_btn = st.button(
         "▶ 計算実行", type="primary", use_container_width=True,
-        disabled=(bb_file is None),
+        disabled=not _has_input,
     )
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-if bb_file is None:
-    st.info("👈 左のサイドバーから広告面板 CSV をアップロードしてください。")
+_csv_mode = (bb_input_mode == "📂 CSVアップロード")
+
+# 入力チェック
+if (_csv_mode and bb_file is None) or (not _csv_mode and not manual_bb):
+    st.info("👈 左のサイドバーから広告面板データを入力してください。")
     st.stop()
 
-# CSV 読み込み
-try:
-    bb_df = pd.read_csv(bb_file)
-    required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg"}
-    missing  = required - set(bb_df.columns)
-    if missing:
-        st.error(f"CSV に必要な列がありません: {missing}")
+# bb_df の構築
+if _csv_mode:
+    try:
+        bb_df = pd.read_csv(bb_file)
+        required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg"}
+        missing  = required - set(bb_df.columns)
+        if missing:
+            st.error(f"CSV に必要な列がありません: {missing}")
+            st.stop()
+        if "max_range_m" not in bb_df.columns:
+            bb_df["max_range_m"] = 500.0
+        bb_df["max_range_m"] = bb_df["max_range_m"].fillna(500.0)
+    except Exception as e:
+        st.error(f"CSV 読み込みエラー: {e}")
         st.stop()
-    if "max_range_m" not in bb_df.columns:
-        bb_df["max_range_m"] = 500.0
-    bb_df["max_range_m"] = bb_df["max_range_m"].fillna(500.0)
-except Exception as e:
-    st.error(f"CSV 読み込みエラー: {e}")
-    st.stop()
+else:
+    bb_df = pd.DataFrame([manual_bb])
 
 st.success(f"広告面板 {len(bb_df)} 件を読み込みました")
 st.dataframe(bb_df, use_container_width=True)
@@ -1074,20 +1134,54 @@ if "result_df" in st.session_state:
 
     st.divider()
     st.subheader("🗺️ 視認エリアマップ")
-    st.caption("🟢→🔴 建物（低→高）　🔵 有効メッシュ矩形（扇形内面積比≥80%）　🟡 有効扇形（デッドゾーン除外）　→ 方向矢印")
+    st.caption("🟢→🔴 建物（低→高）　● 有効メッシュ矩形（扇形内面積比≥80%）　🟡 有効扇形（デッドゾーン除外）　→ 方向矢印")
+
+    # ── 地図表示設定（フィルター + メッシュ色） ──────────────────────────
+    with st.expander("🎛️ 地図表示設定", expanded=True):
+        _n_bb  = len(bb_list)
+        _fcols = st.columns(min(_n_bb, 4))
+        _show  = {}
+        _mcols = {}
+        for _i, _bb in enumerate(bb_list):
+            _s = str(_bb["screen_id"])
+            with _fcols[_i % min(_n_bb, 4)]:
+                _show[_s]  = st.checkbox(
+                    f"表示: {_s}", value=True, key=f"show_{_s}"
+                )
+                _mcols[_s] = st.color_picker(
+                    f"メッシュ色: {_s}",
+                    value=COLORS[_i % len(COLORS)],
+                    key=f"meshcol_{_s}",
+                )
+
+    # フィルタ適用
+    _fbb  = [bb  for bb       in bb_list    if _show.get(str(bb["screen_id"]),  True)]
+    _fvis = [vdf for bb, vdf  in zip(bb_list, all_visible) if _show.get(str(bb["screen_id"]), True)]
+    _fsec = [sec for bb, sec  in zip(bb_list, all_sectors) if _show.get(str(bb["screen_id"]), True)]
+
     with st.spinner("地図を生成中..."):
-        fig = build_map(bb_list, all_sectors, all_visible, buildings_calc)
+        fig = build_map(_fbb, _fsec, _fvis, buildings_calc, mesh_colors=_mcols)
     st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
-    if not result_df.empty:
-        csv_bytes = result_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            label="⬇️ 有効メッシュ CSV をダウンロード",
-            data=csv_bytes,
-            file_name="visible_meshes.csv",
-            mime="text/csv",
-            type="primary",
-        )
-    else:
+    st.subheader("⬇️ メッシュコード CSV ダウンロード（面別）")
+    st.caption("各ファイルはメッシュコードのみ・ヘッダーなし。ファイル名は Screen ID です。")
+    _dl_any = False
+    _dl_cols = st.columns(min(len(bb_list), 4))
+    for _i, (_bb, _vdf) in enumerate(zip(bb_list, all_visible)):
+        _sid = str(_bb["screen_id"])
+        if not _vdf.empty:
+            _dl_any = True
+            _mesh_csv = _vdf["mesh_code"].to_csv(index=False, header=False).encode("utf-8")
+            with _dl_cols[_i % min(len(bb_list), 4)]:
+                st.download_button(
+                    label=f"⬇️ {_sid}.csv ({len(_vdf):,}件)",
+                    data=_mesh_csv,
+                    file_name=f"{_sid}.csv",
+                    mime="text/csv",
+                    key=f"dl_{_sid}_{_i}",
+                    type="primary",
+                    use_container_width=True,
+                )
+    if not _dl_any:
         st.warning("有効メッシュが 0 件でした。設定を見直してください。")
