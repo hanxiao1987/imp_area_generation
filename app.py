@@ -1368,3 +1368,157 @@ if "result_df" in st.session_state:
                 )
     if not _dl_any:
         st.warning("有効メッシュが 0 件でした。設定を見直してください。")
+
+    # ── 視線遮蔽建物の除外補正 ────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🚫 視線遮蔽建物の除外補正")
+
+    _excl_key = "excluded_bldg_indices"
+    if _excl_key not in st.session_state:
+        st.session_state[_excl_key] = set()
+    _excl_set: set = st.session_state[_excl_key]
+
+    _excl_mode = st.session_state.get("exclusion_mode", False)
+
+    _ec1, _ec2, _ec3 = st.columns([2, 2, 2])
+    with _ec1:
+        if st.button(
+            "✏️ 除外建物を選択する" if not _excl_mode else "✅ 選択モードを閉じる",
+            key="excl_mode_toggle",
+            use_container_width=True,
+        ):
+            st.session_state["exclusion_mode"] = not _excl_mode
+            st.rerun()
+    if _excl_set:
+        with _ec2:
+            st.info(f"除外済み建物: {len(_excl_set)} 棟")
+        with _ec3:
+            if st.button("🗑️ 除外リストをクリア", key="clear_excl", use_container_width=True):
+                st.session_state[_excl_key] = set()
+                st.rerun()
+
+    if _excl_mode:
+        if buildings_calc is None or buildings_calc.empty:
+            st.warning("建物データがありません。建物データありで計算した場合のみ除外補正が使用できます。")
+        elif not _FOLIUM_OK:
+            st.warning("folium / streamlit-folium が未インストールです。`pip install folium streamlit-folium` を実行してください。")
+        else:
+            # 各扇形エリア内の建物に絞り込み
+            _bldg_idx_in_area: set = set()
+            for _sec in all_sectors:
+                _hits = buildings_calc[buildings_calc.geometry.intersects(_sec.buffer(0.001))].index.tolist()
+                _bldg_idx_in_area.update(_hits)
+            _bldgs_in_area = buildings_calc.loc[sorted(_bldg_idx_in_area)]
+
+            st.caption(
+                f"対象エリア内の建物: {len(_bldgs_in_area):,} 棟　｜　"
+                "🔴 赤 = 除外済み（クリックで復活）　🔵 青 = 計算対象（クリックで除外）"
+            )
+
+            _center_lat = np.mean([_b["latitude"]  for _b in bb_list])
+            _center_lon = np.mean([_b["longitude"] for _b in bb_list])
+            _efm = folium.Map(
+                location=[_center_lat, _center_lon], zoom_start=17, tiles="OpenStreetMap"
+            )
+
+            # 扇形エリアを薄く表示
+            for _ebb, _esec in zip(bb_list, all_sectors):
+                folium.Polygon(
+                    locations=[[p[1], p[0]] for p in _esec.exterior.coords],
+                    color="gold", fill=True, fill_opacity=0.05, weight=1.5,
+                    tooltip=f"{_ebb['screen_id']} 扇形エリア",
+                ).add_to(_efm)
+
+            # 面板マーカー
+            for _ebb in bb_list:
+                folium.Marker(
+                    location=[_ebb["latitude"], _ebb["longitude"]],
+                    tooltip=str(_ebb["screen_id"]),
+                    icon=folium.Icon(color="orange", icon="flag"),
+                ).add_to(_efm)
+
+            # 建物ポリゴン（クリック可能）
+            for _bidx, _brow in _bldgs_in_area.iterrows():
+                _is_excl = _bidx in _excl_set
+                _bcolor  = "red" if _is_excl else "blue"
+                _bfill   = 0.55 if _is_excl else 0.30
+                try:
+                    _bgeom = _brow.geometry
+                    _bpolys = list(_bgeom.geoms) if _bgeom.geom_type.startswith("Multi") else [_bgeom]
+                    for _bpoly in _bpolys:
+                        if _bpoly.geom_type != "Polygon":
+                            continue
+                        folium.Polygon(
+                            locations=[[p[1], p[0]] for p in _bpoly.exterior.coords],
+                            color=_bcolor,
+                            fill=True,
+                            fill_color=_bcolor,
+                            fill_opacity=_bfill,
+                            weight=2 if _is_excl else 1,
+                            tooltip=str(_bidx),
+                            popup=folium.Popup(
+                                f"建物 #{_bidx}<br>高さ: {_brow['height']:.1f}m<br>"
+                                f"{'🚫 除外済み（クリックで復活）' if _is_excl else '✅ 計算対象（クリックで除外）'}",
+                                max_width=220,
+                            ),
+                        ).add_to(_efm)
+                except Exception:
+                    continue
+
+            _emap_res = st_folium(
+                _efm,
+                key="excl_folium",
+                height=540,
+                use_container_width=True,
+                returned_objects=["last_object_clicked_tooltip"],
+            )
+
+            # クリックされた建物を除外セットに追加 / 解除
+            if _emap_res and _emap_res.get("last_object_clicked_tooltip"):
+                _tip = str(_emap_res["last_object_clicked_tooltip"])
+                try:
+                    _clicked_idx = int(_tip)
+                    if _clicked_idx in _bldg_idx_in_area:
+                        _new_excl = set(st.session_state.get(_excl_key, set()))
+                        if _clicked_idx in _new_excl:
+                            _new_excl.discard(_clicked_idx)
+                        else:
+                            _new_excl.add(_clicked_idx)
+                        st.session_state[_excl_key] = _new_excl
+                        st.rerun()
+                except (ValueError, TypeError):
+                    pass
+
+    # 除外設定がある場合は再計算ボタンを表示
+    if _excl_set:
+        st.divider()
+        if st.button(
+            f"🔄 除外設定（{len(_excl_set)} 棟）で再計算する",
+            type="primary",
+            key="recalc_excl_btn",
+            use_container_width=False,
+        ):
+            _filtered_bldgs = (
+                buildings_calc[~buildings_calc.index.isin(_excl_set)].copy()
+                if buildings_calc is not None
+                else None
+            )
+            _rprog = st.progress(0, text="再計算中...")
+            _new_visible_r: list = []
+            _new_sectors_r: list = []
+            for _ri, _rbb in enumerate(bb_list):
+                def _rcb(frac, text, _i=_ri):
+                    _rprog.progress((_i + frac) / len(bb_list), text=text)
+                _rvdf, _rsec, _ = compute_visibility(_rbb, _filtered_bldgs, _rcb)
+                _new_visible_r.append(_rvdf)
+                _new_sectors_r.append(_rsec)
+            _rprog.progress(1.0, text="再計算完了！")
+            st.session_state["result_df"] = (
+                pd.concat(_new_visible_r, ignore_index=True)
+                if any(not _v.empty for _v in _new_visible_r)
+                else pd.DataFrame()
+            )
+            st.session_state["all_visible"]    = _new_visible_r
+            st.session_state["all_sectors"]    = _new_sectors_r
+            st.session_state["exclusion_mode"] = False
+            st.rerun()
