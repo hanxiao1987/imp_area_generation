@@ -863,8 +863,9 @@ with st.sidebar:
 
     if bb_input_mode == "📂 CSVアップロード":
         st.markdown("""
-**必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`
-**任意列**: `max_range_m`（デフォルト 500m）
+**必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`, `panel_h_m`, `panel_w_m`
+
+最大視認距離は `panel_h_m × panel_w_m × 7` で自動計算されます。
 """)
         bb_file = st.file_uploader("CSVをアップロード", type=["csv"], key="bb_csv")
     else:
@@ -875,7 +876,8 @@ with st.sidebar:
             m_lon   = st.number_input("経度 longitude",          value=139.7671, format="%.6f")
             m_h     = st.number_input("高さ height_m (m)",       value=10.0,  min_value=0.1,  step=0.5)
             m_f     = st.number_input("面向角度 facing_deg (°)", value=180.0, min_value=0.0,  max_value=359.9, step=1.0)
-            m_r     = st.number_input("最大視認距離 max_range_m (m)", value=500.0, min_value=10.0, step=10.0)
+            m_ph    = st.number_input("面の縦 panel_h_m (m)", value=3.0, min_value=0.1, step=0.1)
+            m_pw    = st.number_input("面の横 panel_w_m (m)", value=6.0, min_value=0.1, step=0.1)
             submitted = st.form_submit_button("✅ 設定を反映", use_container_width=True)
 
         if submitted:
@@ -894,7 +896,9 @@ with st.sidebar:
                     "longitude":   m_lon,
                     "height_m":    m_h,
                     "facing_deg":  m_f,
-                    "max_range_m": m_r,
+                    "panel_h_m":   m_ph,
+                    "panel_w_m":   m_pw,
+                    "max_range_m": round(m_ph * m_pw * 7, 1),
                 }
 
         if st.session_state.get("manual_bb"):
@@ -903,7 +907,8 @@ with st.sidebar:
             st.success(
                 f"✅ **{d['screen_id']}** 設定済み  \n"
                 f"緯度 {d['latitude']:.5f} / 経度 {d['longitude']:.5f}  \n"
-                f"高さ {d['height_m']}m｜方位 {d['facing_deg']}°｜範囲 {d['max_range_m']}m"
+                f"高さ {d['height_m']}m｜方位 {d['facing_deg']}°  \n"
+                f"面サイズ {d['panel_h_m']}×{d['panel_w_m']}m → 最大視認距離 {d['max_range_m']}m"
             )
 
     st.divider()
@@ -980,14 +985,13 @@ if (_csv_mode and bb_file is None) or (not _csv_mode and not manual_bb):
 if _csv_mode:
     try:
         bb_df = pd.read_csv(bb_file)
-        required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg"}
+        required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg",
+                    "panel_h_m", "panel_w_m"}
         missing  = required - set(bb_df.columns)
         if missing:
             st.error(f"CSV に必要な列がありません: {missing}")
             st.stop()
-        if "max_range_m" not in bb_df.columns:
-            bb_df["max_range_m"] = 500.0
-        bb_df["max_range_m"] = bb_df["max_range_m"].fillna(500.0)
+        bb_df["max_range_m"] = (bb_df["panel_h_m"] * bb_df["panel_w_m"] * 7).round(1)
     except Exception as e:
         st.error(f"CSV 読み込みエラー: {e}")
         st.stop()
@@ -1126,7 +1130,7 @@ if "result_df" in st.session_state:
             st.metric(
                 label=str(bb["screen_id"]),
                 value=f"{len(vdf):,} メッシュ",
-                help=f"方位 {bb['facing_deg']}° / 高さ {bb['height_m']}m / 範囲 {bb.get('max_range_m',500)}m",
+                help=f"方位 {bb['facing_deg']}° / 高さ {bb['height_m']}m / 面 {bb.get('panel_h_m','?')}×{bb.get('panel_w_m','?')}m / 最大視認距離 {bb.get('max_range_m','?')}m",
             )
 
     if not result_df.empty:
