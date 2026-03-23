@@ -571,6 +571,12 @@ def _is_blocked(src_lon, src_lat, src_h,
 
 def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
                        progress_cb=None) -> tuple:
+    """
+    視認エリア計算。
+    - デッドゾーン: 原点から半径 height_m 以内を除外
+    - メッシュ判定: メッシュ面積の80%以上が有効扇形内 → 有効メッシュ
+    - 建物LOS: 建物データがある場合、重心点のLOS確認で完全遮蔽を除外
+    """
     lat, lon  = bb["latitude"], bb["longitude"]
     h         = bb["height_m"]
     facing    = bb["facing_deg"]
@@ -581,7 +587,16 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
     lat_sz, lon_sz = mesh10_cell_size()
     lat_sc, lon_sc = local_scale(lat)
 
-    minlon, minlat, maxlon, maxlat = sector.bounds
+    # ── デッドゾーン: 原点から height_m 以内の扇形を除外 ──────────────────
+    dead_r_deg = h / ((lat_sc + lon_sc) / 2)
+    dead_zone  = Point(lon, lat).buffer(dead_r_deg)
+    eff_sector = sector.difference(dead_zone)
+
+    if eff_sector.is_empty:
+        return pd.DataFrame(), eff_sector, 0
+
+    # ── 有効扇形と交差するメッシュを列挙 ────────────────────────────────
+    minlon, minlat, maxlon, maxlat = eff_sector.bounds
     start_lat = math.floor(minlat / lat_sz) * lat_sz
     start_lon = math.floor(minlon / lon_sz) * lon_sz
     all_lats  = np.arange(start_lat, maxlat + lat_sz, lat_sz)
@@ -589,71 +604,64 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
 
     mesh_boxes = [
         {"lat": la + lat_sz/2, "lon": lo + lon_sz/2,
-         "box": box(lo, la, lo+lon_sz, la+lat_sz), "lat0": la, "lon0": lo}
+         "box": box(lo, la, lo+lon_sz, la+lat_sz)}
         for la in all_lats for lo in all_lons
-        if sector.intersects(box(lo, la, lo+lon_sz, la+lat_sz))
+        if eff_sector.intersects(box(lo, la, lo+lon_sz, la+lat_sz))
     ]
     total = len(mesh_boxes)
     if total == 0:
-        return pd.DataFrame(), sector, 0
+        return pd.DataFrame(), eff_sector, 0
 
+    # ── 建物 sindex (LOS用) ────────────────────────────────────────────
     if buildings_gdf is not None and not buildings_gdf.empty:
-        bldgs  = buildings_gdf[buildings_gdf.geometry.intersects(sector.buffer(0.001))].copy()
+        bldgs  = buildings_gdf[
+            buildings_gdf.geometry.intersects(sector.buffer(0.001))
+        ].copy()
         sindex = bldgs.sindex if not bldgs.empty else None
     else:
         bldgs  = None
         sindex = None
 
-    sample_offsets_lat = np.linspace(0.1, 0.9, SAMPLE_N) * lat_sz
-    sample_offsets_lon = np.linspace(0.1, 0.9, SAMPLE_N) * lon_sz
+    mesh_area = lat_sz * lon_sz  # 全メッシュ面積は共通
 
     visible_rows = []
     for i, m in enumerate(mesh_boxes):
-        if progress_cb and i % 20 == 0:
-            progress_cb(i / total, f"{sid}: LOS計算 {i}/{total}")
+        if progress_cb and i % 50 == 0:
+            progress_cb(i / total, f"{sid}: メッシュ判定 {i}/{total}")
 
-        la0, lo0  = m["lat0"], m["lon0"]
-        clip = sector.intersection(m["box"])
-        if clip.is_empty:
+        mesh_box = m["box"]
+
+        # ── 面積判定: メッシュ面積の80%以上が有効扇形内 ────────────────
+        inter = eff_sector.intersection(mesh_box)
+        if inter.is_empty:
+            continue
+        area_ratio = inter.area / mesh_area
+        if area_ratio < VISIBLE_RATIO_THRESHOLD:
             continue
 
-        sample_pts = [
-            (lo0+dln, la0+dlt)
-            for dlt in sample_offsets_lat
-            for dln in sample_offsets_lon
-            if clip.contains(Point(lo0+dln, la0+dlt))
-        ]
-        if not sample_pts:
-            continue
+        # ── 建物LOSチェック: 重心点が完全遮蔽なら除外 ────────────────
+        if bldgs is not None and sindex is not None:
+            cx, cy = inter.centroid.x, inter.centroid.y
+            ray    = LineString([(lon, lat), (cx, cy)])
+            cands  = bldgs.iloc[list(sindex.intersection(ray.bounds))]
+            if _is_blocked(lon, lat, h, cx, cy, EYE_HEIGHT_M,
+                           cands, lat_sc, lon_sc):
+                continue
 
-        n_visible = 0
-        for (slo, sla) in sample_pts:
-            if bldgs is not None and sindex is not None:
-                ray   = LineString([(lon, lat), (slo, sla)])
-                cands = bldgs.iloc[list(sindex.intersection(ray.bounds))]
-                blocked = _is_blocked(lon, lat, h, slo, sla, EYE_HEIGHT_M,
-                                      cands, lat_sc, lon_sc)
-            else:
-                blocked = False
-            if not blocked:
-                n_visible += 1
+        code   = encode_mesh10(m["lat"], m["lon"])
+        dx_m   = (m["lon"] - lon) * lon_sc
+        dy_m   = (m["lat"] - lat) * lat_sc
+        dist_m = math.sqrt(dx_m**2 + dy_m**2)
+        visible_rows.append({
+            "billboard_id": sid,
+            "mesh_code":    code,
+            "center_lat":   round(m["lat"], 8),
+            "center_lon":   round(m["lon"], 8),
+            "distance_m":   round(dist_m, 1),
+            "area_ratio":   round(area_ratio, 3),
+        })
 
-        vis_ratio = n_visible / len(sample_pts)
-        if vis_ratio >= VISIBLE_RATIO_THRESHOLD:
-            code  = encode_mesh10(m["lat"], m["lon"])
-            dx_m  = (m["lon"] - lon) * lon_sc
-            dy_m  = (m["lat"] - lat) * lat_sc
-            dist_m = math.sqrt(dx_m**2 + dy_m**2)
-            visible_rows.append({
-                "billboard_id":  sid,
-                "mesh_code":     code,
-                "center_lat":    round(m["lat"], 8),
-                "center_lon":    round(m["lon"], 8),
-                "distance_m":    round(dist_m, 1),
-                "visible_ratio": round(vis_ratio, 3),
-            })
-
-    return pd.DataFrame(visible_rows), sector, total
+    return pd.DataFrame(visible_rows), eff_sector, total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -749,7 +757,7 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                 lo0 = row["center_lon"] - lon_sz / 2
                 txt = (f"{row['mesh_code']}<br>"
                        f"距離: {row['distance_m']}m<br>"
-                       f"可視率: {row['visible_ratio']*100:.1f}%")
+                       f"扇形内面積比: {row['area_ratio']*100:.1f}%")
                 # SW→SE→NE→NW→SW の順で閉じる
                 box_lats.extend([la0,          la0,          la0+lat_sz, la0+lat_sz, la0,          None])
                 box_lons.extend([lo0,          lo0+lon_sz,   lo0+lon_sz, lo0,        lo0,          None])
@@ -764,6 +772,7 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                 text=box_texts,
                 hovertemplate="%{text}<extra></extra>",
             ))
+
 
         lat, lon = bb["latitude"], bb["longitude"]
         facing   = bb["facing_deg"]
@@ -967,12 +976,23 @@ prev_fig = go.Figure()
 for idx, row in bb_df.iterrows():
     color  = COLORS[idx % len(COLORS)]
     sector = create_sector(row.latitude, row.longitude, row.facing_deg, row.max_range_m)
-    xs, ys = sector.exterior.xy
-    prev_fig.add_trace(go.Scattermapbox(
-        lat=list(ys), lon=list(xs), mode="lines", fill="toself",
-        fillcolor="rgba(255,200,0,0.10)", line=dict(color=color, width=1.5),
-        name=f"{row.screen_id} 扇形", hoverinfo="skip",
-    ))
+    # 有効扇形（デッドゾーン除外）
+    lat_sc_p, lon_sc_p = local_scale(row.latitude)
+    dead_r_deg_p = row.height_m / ((lat_sc_p + lon_sc_p) / 2)
+    dead_zone_p  = Point(row.longitude, row.latitude).buffer(dead_r_deg_p)
+    eff_sector_p = sector.difference(dead_zone_p)
+    # 有効扇形ポリゴンを描画（複数ポリゴンになる場合も対応）
+    polys_p = list(eff_sector_p.geoms) if eff_sector_p.geom_type.startswith("Multi") else [eff_sector_p]
+    for pi, poly in enumerate(polys_p):
+        if poly.is_empty or poly.geom_type != "Polygon":
+            continue
+        xs, ys = poly.exterior.xy
+        prev_fig.add_trace(go.Scattermapbox(
+            lat=list(ys), lon=list(xs), mode="lines", fill="toself",
+            fillcolor="rgba(255,200,0,0.15)", line=dict(color=color, width=1.5),
+            name=f"{row.screen_id} 有効扇形" if pi == 0 else f"{row.screen_id} 有効扇形_{pi}",
+            hoverinfo="skip",
+        ))
     lat_sc, lon_sc = local_scale(row.latitude)
     arr_lat = row.latitude  + 40.0 * math.sin(math.radians(row.facing_deg)) / lat_sc
     arr_lon = row.longitude + 40.0 * math.cos(math.radians(90.0 - row.facing_deg)) / lon_sc
@@ -1054,7 +1074,7 @@ if "result_df" in st.session_state:
 
     st.divider()
     st.subheader("🗺️ 視認エリアマップ")
-    st.caption("🟢→🔴 建物（低→高）　🔵 有効メッシュ矩形（可視率≥80%）　🟡 扇形エリア（120°）　→ 方向矢印")
+    st.caption("🟢→🔴 建物（低→高）　🔵 有効メッシュ矩形（扇形内面積比≥80%）　🟡 有効扇形（デッドゾーン除外）　→ 方向矢印")
     with st.spinner("地図を生成中..."):
         fig = build_map(bb_list, all_sectors, all_visible, buildings_calc)
     st.plotly_chart(fig, use_container_width=True)
