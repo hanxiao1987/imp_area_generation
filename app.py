@@ -535,6 +535,17 @@ def auto_fetch_citygml(billboards_df: pd.DataFrame,
     combined = gpd.GeoDataFrame(
         pd.concat(all_gdfs, ignore_index=True), crs="EPSG:4326"
     )
+    # 3次メッシュ単位で余分に取得した扇形エリア外の建物を除去
+    _sec_union = None
+    for _, _bb in billboards_df.iterrows():
+        _s = create_sector(_bb.latitude, _bb.longitude, _bb.facing_deg, _bb.max_range_m)
+        _sec_union = _s if _sec_union is None else _sec_union.union(_s)
+    if _sec_union is not None:
+        before = len(combined)
+        combined = combined[
+            combined.geometry.intersects(_sec_union.buffer(0.0001))
+        ].reset_index(drop=True)
+        log(f"✂️ 扇形エリア外を除去: {before:,} → {len(combined):,} 棟")
     log(f"\n✅ **取得完了: 建物 {len(combined):,} 棟**")
     return combined
 
@@ -685,6 +696,16 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
               buildings_gdf: Optional[gpd.GeoDataFrame],
               mesh_colors: Optional[dict] = None) -> go.Figure:
     fig = go.Figure()
+
+    if buildings_gdf is not None and not buildings_gdf.empty:
+        # 扇形エリア内の建物のみに絞り込んでプロット
+        _map_area = None
+        for _ms in sectors:
+            _map_area = _ms if _map_area is None else _map_area.union(_ms)
+        if _map_area is not None:
+            buildings_gdf = buildings_gdf[
+                buildings_gdf.geometry.intersects(_map_area.buffer(0.00005))
+            ]
 
     if buildings_gdf is not None and not buildings_gdf.empty:
         # 建物を高さ5段階に分け各グループを1トレースに集約 (緑→赤グラデーション)
