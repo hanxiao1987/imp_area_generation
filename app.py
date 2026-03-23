@@ -698,10 +698,14 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
     fig = go.Figure()
 
     if buildings_gdf is not None and not buildings_gdf.empty:
-        # 扇形エリア内の建物のみに絞り込んでプロット
+        # 各面板のフル扇形の合計エリア内の建物のみプロット
         _map_area = None
-        for _ms in sectors:
-            _map_area = _ms if _map_area is None else _map_area.union(_ms)
+        for _bb in billboards:
+            _s = create_sector(
+                _bb["latitude"], _bb["longitude"],
+                _bb["facing_deg"], _bb.get("max_range_m", 500.0),
+            )
+            _map_area = _s if _map_area is None else _map_area.union(_s)
         if _map_area is not None:
             buildings_gdf = buildings_gdf[
                 buildings_gdf.geometry.intersects(_map_area.buffer(0.00005))
