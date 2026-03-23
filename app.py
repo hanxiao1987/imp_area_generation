@@ -1405,10 +1405,18 @@ if "result_df" in st.session_state:
         elif not _FOLIUM_OK:
             st.warning("folium / streamlit-folium が未インストールです。`pip install folium streamlit-folium` を実行してください。")
         else:
-            # 各扇形エリア内の建物に絞り込み
+            # bb_listからフル扇形を再生成して建物を絞り込み
             _bldg_idx_in_area: set = set()
-            for _sec in all_sectors:
-                _hits = buildings_calc[buildings_calc.geometry.intersects(_sec.buffer(0.00005))].index.tolist()
+            _full_sectors_excl = []
+            for _ebb in bb_list:
+                _fs = create_sector(
+                    _ebb["latitude"], _ebb["longitude"],
+                    _ebb["facing_deg"], _ebb.get("max_range_m", 500.0),
+                )
+                _full_sectors_excl.append(_fs)
+                _hits = buildings_calc[
+                    buildings_calc.geometry.intersects(_fs.buffer(0.00005))
+                ].index.tolist()
                 _bldg_idx_in_area.update(_hits)
             _bldgs_in_area = buildings_calc.loc[sorted(_bldg_idx_in_area)].copy()
 
@@ -1423,13 +1431,21 @@ if "result_df" in st.session_state:
                 location=[_center_lat, _center_lon], zoom_start=17, tiles="OpenStreetMap"
             )
 
-            # 扇形エリアを薄く表示
-            for _ebb, _esec in zip(bb_list, all_sectors):
-                folium.Polygon(
-                    locations=[[p[1], p[0]] for p in _esec.exterior.coords],
-                    color="gold", fill=True, fill_opacity=0.05, weight=1.5,
-                    tooltip=f"{_ebb['screen_id']} 扇形エリア",
-                ).add_to(_efm)
+            # 扇形エリアを薄く表示（フル扇形を使用）
+            for _ebb, _fsec_e in zip(bb_list, _full_sectors_excl):
+                _fpolys = (
+                    list(_fsec_e.geoms)
+                    if _fsec_e.geom_type.startswith("Multi")
+                    else [_fsec_e]
+                )
+                for _fpoly in _fpolys:
+                    if _fpoly.geom_type != "Polygon":
+                        continue
+                    folium.Polygon(
+                        locations=[[p[1], p[0]] for p in _fpoly.exterior.coords],
+                        color="gold", fill=True, fill_opacity=0.05, weight=1.5,
+                        tooltip=f"{_ebb['screen_id']} 扇形エリア",
+                    ).add_to(_efm)
 
             # 面板マーカー
             for _ebb in bb_list:
