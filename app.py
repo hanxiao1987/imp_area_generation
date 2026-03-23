@@ -1464,15 +1464,20 @@ if "result_df" in st.session_state:
             folium.GeoJson(
                 _bldgs_in_area[["geometry", "_idx", "height"]],
                 style_function=lambda f, _es=_excl_str: {
-                    "fillColor":   "red"    if f["properties"]["_idx"] in _es else "#2196f3",
+                    "fillColor":   "red"     if f["properties"]["_idx"] in _es else "#2196f3",
                     "color":       "#cc0000" if f["properties"]["_idx"] in _es else "#0050b0",
-                    "weight":      2        if f["properties"]["_idx"] in _es else 1,
-                    "fillOpacity": 0.6      if f["properties"]["_idx"] in _es else 0.3,
+                    "weight":      2         if f["properties"]["_idx"] in _es else 1,
+                    "fillOpacity": 0.6       if f["properties"]["_idx"] in _es else 0.3,
                 },
+                # tooltip は _idx のみ（last_object_clicked_tooltip でパース）
                 tooltip=folium.GeoJsonTooltip(
+                    fields=["_idx"],
+                    aliases=[""],
+                    labels=False,
+                ),
+                popup=folium.GeoJsonPopup(
                     fields=["_idx", "height"],
                     aliases=["建物ID:", "高さ(m):"],
-                    localize=True,
                 ),
                 name="buildings",
             ).add_to(_efm)
@@ -1482,30 +1487,25 @@ if "result_df" in st.session_state:
                 key="excl_folium",
                 height=540,
                 use_container_width=True,
-                returned_objects=["last_object_clicked"],
+                returned_objects=["last_object_clicked_tooltip"],
             )
 
             # クリックされた建物を除外セットに追加 / 解除
-            if _emap_res and _emap_res.get("last_object_clicked"):
-                _clicked_props = _emap_res["last_object_clicked"]
-                _idx_str = (
-                    _clicked_props.get("_idx")
-                    if isinstance(_clicked_props, dict)
-                    else None
-                )
-                if _idx_str is not None:
-                    try:
-                        _clicked_idx = int(_idx_str)
-                        if _clicked_idx in _bldg_idx_in_area:
-                            _new_excl = set(st.session_state.get(_excl_key, set()))
-                            if _clicked_idx in _new_excl:
-                                _new_excl.discard(_clicked_idx)
-                            else:
-                                _new_excl.add(_clicked_idx)
-                            st.session_state[_excl_key] = _new_excl
-                            st.rerun()
-                    except (ValueError, TypeError):
-                        pass
+            if _emap_res and _emap_res.get("last_object_clicked_tooltip"):
+                _tip = str(_emap_res["last_object_clicked_tooltip"]).strip()
+                # tooltipは _idx の数値文字列のみ
+                try:
+                    _clicked_idx = int(_tip)
+                    if _clicked_idx in _bldg_idx_in_area:
+                        _new_excl = set(st.session_state.get(_excl_key, set()))
+                        if _clicked_idx in _new_excl:
+                            _new_excl.discard(_clicked_idx)
+                        else:
+                            _new_excl.add(_clicked_idx)
+                        st.session_state[_excl_key] = _new_excl
+                        st.rerun()
+                except (ValueError, TypeError):
+                    pass
 
     # 除外設定がある場合は再計算ボタンを表示
     if _excl_set:
