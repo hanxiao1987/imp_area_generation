@@ -10,6 +10,7 @@ import struct
 import zlib
 import urllib.request
 import json as _json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import numpy as np
@@ -38,6 +39,7 @@ EYE_HEIGHT_M             = 1.5
 SAMPLE_N                 = 5
 VISIBLE_RATIO_THRESHOLD  = 0.80
 LOS_TOLERANCE_M          = 0.1
+MAX_BILLBOARDS           = 30
 
 COLORS = [
     "#e63946", "#2196f3", "#ff9800", "#4caf50",
@@ -467,13 +469,14 @@ def auto_fetch_citygml(billboards_df: pd.DataFrame,
         return None
     log(f"✅ カタログ取得完了（{len(catalog)} 市区町村がPlateau対応）")
 
-    # ② 逆ジオコーディング
+    # ② 逆ジオコーディング（並列）
     log("📍 広告面板の市区町村を特定中...")
     muni_cds = set()
-    for _, bb in billboards_df.iterrows():
-        muni_cd = _gsi_reverse_geocode(bb.latitude, bb.longitude)
-        if muni_cd:
-            muni_cds.add(muni_cd)
+    _bb_rows = [(row.latitude, row.longitude) for _, row in billboards_df.iterrows()]
+    with ThreadPoolExecutor(max_workers=min(len(_bb_rows), 8)) as _ex:
+        for muni_cd in _ex.map(lambda p: _gsi_reverse_geocode(*p), _bb_rows):
+            if muni_cd:
+                muni_cds.add(muni_cd)
     if not muni_cds:
         log("❌ 市区町村コードを取得できませんでした（ネットワークを確認してください）")
         return None
@@ -514,19 +517,27 @@ def auto_fetch_citygml(billboards_df: pd.DataFrame,
             log(f"⚠️ 対象メッシュの GML が ZIP 内に見つかりませんでした")
             continue
 
-        log(f"⬇️ {len(needed)} 個の GML ファイルをダウンロード中...")
-        for fname, (local_off, comp_size, method) in needed.items():
-            log(f"　　`{fname}` ({comp_size // 1024:,} KB 圧縮)...")
-            try:
-                gml_bytes = _extract_gml_from_zip(zip_url, local_off, comp_size, method)
-                gdf = parse_citygml(gml_bytes)
-                if not gdf.empty:
-                    all_gdfs.append(gdf)
-                    log(f"　　✅ `{fname}`: 建物 {len(gdf):,} 棟")
-                else:
-                    log(f"　　⚠️ `{fname}`: 建物データが空でした")
-            except Exception as e:
-                log(f"　　❌ `{fname}` 取得失敗: {e}")
+        log(f"⬇️ {len(needed)} 個の GML ファイルをダウンロード中（並列）...")
+
+        def _fetch_one_gml(item):
+            fname, (local_off, comp_size, method) = item
+            gml_bytes = _extract_gml_from_zip(zip_url, local_off, comp_size, method)
+            return fname, comp_size, parse_citygml(gml_bytes)
+
+        with ThreadPoolExecutor(max_workers=min(len(needed), 6)) as _gex:
+            _gfuts = {_gex.submit(_fetch_one_gml, item): item[0]
+                      for item in needed.items()}
+            for _fut in as_completed(_gfuts):
+                _fname = _gfuts[_fut]
+                try:
+                    _fn, _cs, gdf = _fut.result()
+                    if not gdf.empty:
+                        all_gdfs.append(gdf)
+                        log(f"　　✅ `{_fn}`: 建物 {len(gdf):,} 棟")
+                    else:
+                        log(f"　　⚠️ `{_fn}`: 建物データが空でした")
+                except Exception as e:
+                    log(f"　　❌ `{_fname}` 取得失敗: {e}")
 
     if not all_gdfs:
         log("❌ 建物データを取得できませんでした")
@@ -593,13 +604,12 @@ def _is_blocked(src_lon, src_lat, src_h,
 # 視認計算
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
-                       progress_cb=None) -> tuple:
+def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> tuple:
     """
     視認エリア計算。
     - デッドゾーン: 原点から半径 height_m 以内を除外
     - メッシュ判定: メッシュ面積の80%以上が有効扇形内 → 有効メッシュ
-    - 建物LOS: 建物データがある場合、重心点のLOS確認で完全遮蔽を除外
+    - 建物LOS: SAMPLE_N 点全て遮蔽の場合のみ除外
     """
     lat, lon  = bb["latitude"], bb["longitude"]
     h         = bb["height_m"]
@@ -649,10 +659,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
     mesh_area = lat_sz * lon_sz  # 全メッシュ面積は共通
 
     visible_rows = []
-    for i, m in enumerate(mesh_boxes):
-        if progress_cb and i % 50 == 0:
-            progress_cb(i / total, f"{sid}: メッシュ判定 {i}/{total}")
-
+    for m in mesh_boxes:
         mesh_box = m["box"]
 
         # ── 面積判定: メッシュ面積の80%以上が有効扇形内 ────────────────
@@ -663,13 +670,34 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame],
         if area_ratio < VISIBLE_RATIO_THRESHOLD:
             continue
 
-        # ── 建物LOSチェック: 重心点が完全遮蔽なら除外 ────────────────
+        # ── 建物LOSチェック: SAMPLE_N 点全て遮蔽の場合のみ除外 ────────────
         if bldgs is not None and sindex is not None:
-            cx, cy = inter.centroid.x, inter.centroid.y
-            ray    = LineString([(lon, lat), (cx, cy)])
-            cands  = bldgs.iloc[list(sindex.intersection(ray.bounds))]
-            if _is_blocked(lon, lat, h, cx, cy, EYE_HEIGHT_M,
-                           cands, lat_sc, lon_sc):
+            # 重心を先頭に、メッシュ交差領域内に最大 SAMPLE_N 点をサンプリング
+            sample_pts = [(inter.centroid.x, inter.centroid.y)]
+            if SAMPLE_N > 1:
+                minx, miny, maxx, maxy = inter.bounds
+                nx = max(2, int(math.ceil(math.sqrt(SAMPLE_N * 2))))
+                for _gi in range(nx):
+                    for _gj in range(nx):
+                        _px = minx + (maxx - minx) * (_gi + 0.5) / nx
+                        _py = miny + (maxy - miny) * (_gj + 0.5) / nx
+                        if inter.contains(Point(_px, _py)):
+                            sample_pts.append((_px, _py))
+                        if len(sample_pts) >= SAMPLE_N:
+                            break
+                    if len(sample_pts) >= SAMPLE_N:
+                        break
+            sample_pts = sample_pts[:SAMPLE_N]
+
+            all_blocked = True
+            for _sx, _sy in sample_pts:
+                _ray   = LineString([(lon, lat), (_sx, _sy)])
+                _cands = bldgs.iloc[list(sindex.intersection(_ray.bounds))]
+                if not _is_blocked(lon, lat, h, _sx, _sy, EYE_HEIGHT_M,
+                                   _cands, lat_sc, lon_sc):
+                    all_blocked = False
+                    break
+            if all_blocked:
                 continue
 
         code   = encode_mesh10(m["lat"], m["lon"])
@@ -802,7 +830,7 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                 box_lons.extend([lo0,          lo0+lon_sz,   lo0+lon_sz, lo0,        lo0,          None])
                 box_texts.extend([txt, txt, txt, txt, txt, ""])
 
-            _mc = mesh_colors.get(sid) if mesh_colors else None
+            _mc = mesh_colors.get(idx) if mesh_colors else None
             _fc = _hex_to_rgba(_mc, 0.45) if _mc else "rgba(30,130,255,0.45)"
             _lc = _hex_to_rgba(_mc, 0.85) if _mc else "rgba(0,70,210,0.85)"
             fig.add_trace(go.Scattermapbox(
@@ -863,7 +891,10 @@ def _check_password():
     st.caption("このアプリを利用するにはパスワードが必要です。")
     pwd = st.text_input("パスワード", type="password", key="pwd_input")
     if st.button("ログイン", type="primary"):
-        if pwd == st.secrets.get("APP_PASSWORD", ""):
+        _app_pwd = st.secrets.get("APP_PASSWORD", "")
+        if not _app_pwd:
+            st.error("⚠️ APP_PASSWORD が Secrets に設定されていません。管理者に設定してください。")
+        elif pwd == _app_pwd:
             st.session_state["authenticated"] = True
             st.rerun()
         else:
@@ -895,9 +926,9 @@ with st.sidebar:
 
     if bb_input_mode == "📂 CSVアップロード":
         st.markdown("""
-**必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`, `panel_h_m`, `panel_w_m`
+**必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`, `panel_h_mm`, `panel_w_mm`
 
-最大視認距離は `panel_h_m × panel_w_m × 7` で自動計算されます。
+最大視認距離は `panel_h_mm × panel_w_mm × 7 / 1,000,000` で自動計算されます（単位: mm）。
 """)
         bb_file = st.file_uploader("CSVをアップロード", type=["csv"], key="bb_csv")
     else:
@@ -908,8 +939,8 @@ with st.sidebar:
             m_lon   = st.number_input("経度 longitude",          value=139.7671, format="%.6f")
             m_h     = st.number_input("高さ height_m (m)",       value=10.0,  min_value=0.1,  step=0.5)
             m_f     = st.number_input("面向角度 facing_deg (°)", value=180.0, min_value=0.0,  max_value=359.9, step=1.0)
-            m_ph    = st.number_input("面の縦 panel_h_m (m)", value=3.0, min_value=0.1, step=0.1)
-            m_pw    = st.number_input("面の横 panel_w_m (m)", value=6.0, min_value=0.1, step=0.1)
+            m_ph    = st.number_input("面の縦 panel_h_mm (mm)", value=3000, min_value=1, step=10)
+            m_pw    = st.number_input("面の横 panel_w_mm (mm)", value=6000, min_value=1, step=10)
             submitted = st.form_submit_button("✅ 設定を反映", use_container_width=True)
 
         if submitted:
@@ -928,9 +959,9 @@ with st.sidebar:
                     "longitude":   m_lon,
                     "height_m":    m_h,
                     "facing_deg":  m_f,
-                    "panel_h_m":   m_ph,
-                    "panel_w_m":   m_pw,
-                    "max_range_m": round(m_ph * m_pw * 7, 1),
+                    "panel_h_mm":  m_ph,
+                    "panel_w_mm":  m_pw,
+                    "max_range_m": round(m_ph / 1000 * m_pw / 1000 * 7, 1),
                 }
 
         if st.session_state.get("manual_bb"):
@@ -940,7 +971,7 @@ with st.sidebar:
                 f"✅ **{d['screen_id']}** 設定済み  \n"
                 f"緯度 {d['latitude']:.5f} / 経度 {d['longitude']:.5f}  \n"
                 f"高さ {d['height_m']}m｜方位 {d['facing_deg']}°  \n"
-                f"面サイズ {d['panel_h_m']}×{d['panel_w_m']}m → 最大視認距離 {d['max_range_m']}m"
+                f"面サイズ {d['panel_h_mm']}×{d['panel_w_mm']}mm → 最大視認距離 {d['max_range_m']}m"
             )
 
     st.divider()
@@ -1016,14 +1047,20 @@ if (_csv_mode and bb_file is None) or (not _csv_mode and not manual_bb):
 # bb_df の構築
 if _csv_mode:
     try:
-        bb_df = pd.read_csv(bb_file)
+        bb_df = pd.read_csv(bb_file, dtype={"screen_id": str})
         required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg",
-                    "panel_h_m", "panel_w_m"}
+                    "panel_h_mm", "panel_w_mm"}
         missing  = required - set(bb_df.columns)
         if missing:
             st.error(f"CSV に必要な列がありません: {missing}")
             st.stop()
-        bb_df["max_range_m"] = (bb_df["panel_h_m"] * bb_df["panel_w_m"] * 7).round(1)
+        if len(bb_df) > MAX_BILLBOARDS:
+            st.error(f"一度に処理できる面は最大 {MAX_BILLBOARDS} 面です（現在 {len(bb_df)} 行）。CSVを分割してください。")
+            st.stop()
+        _zero_h = bb_df[bb_df["height_m"] == 0]
+        if not _zero_h.empty:
+            st.warning(f"⚠️ `height_m = 0` の行が {len(_zero_h)} 件あります（行: {_zero_h.index.tolist()}）。建物データ使用時はほぼすべてのメッシュが遮蔽されます。正しい高さを設定してください。")
+        bb_df["max_range_m"] = (bb_df["panel_h_mm"] / 1000 * bb_df["panel_w_mm"] / 1000 * 7).round(1)
     except Exception as e:
         st.error(f"CSV 読み込みエラー: {e}")
         st.stop()
@@ -1053,7 +1090,7 @@ for _ci, _cr in bb_df_w.iterrows():
     if _csid in _corr:
         bb_df_w.at[_ci, "latitude"]  = _corr[_csid]["latitude"]
         bb_df_w.at[_ci, "longitude"] = _corr[_csid]["longitude"]
-bb_df_w["max_range_m"] = (bb_df_w["panel_h_m"] * bb_df_w["panel_w_m"] * 7).round(1)
+bb_df_w["max_range_m"] = (bb_df_w["panel_h_mm"] / 1000 * bb_df_w["panel_w_mm"] / 1000 * 7).round(1)
 
 # 建物データ（手動アップロード）
 if gml_file is not None:
@@ -1270,13 +1307,13 @@ with _fin_c1:
             if _fc:
                 _fdf.at[_fi2, "latitude"]  = _fc["latitude"]
                 _fdf.at[_fi2, "longitude"] = _fc["longitude"]
-        _fdf["max_range_m"] = (_fdf["panel_h_m"] * _fdf["panel_w_m"] * 7).round(1)
+        _fdf["max_range_m"] = (_fdf["panel_h_mm"] / 1000 * _fdf["panel_w_mm"] / 1000 * 7).round(1)
         st.session_state["finalized_master"] = _fdf
 
 if "finalized_master" in st.session_state:
     _fmdf = st.session_state["finalized_master"]
     _out_cols = [c for c in ["screen_id", "latitude", "longitude", "height_m",
-                              "facing_deg", "panel_h_m", "panel_w_m"] if c in _fmdf.columns]
+                              "facing_deg", "panel_h_mm", "panel_w_mm"] if c in _fmdf.columns]
     with _fin_c2:
         _csv_out = _fmdf[_out_cols].to_csv(index=False).encode("utf-8-sig")
         st.download_button(
@@ -1290,19 +1327,25 @@ if "finalized_master" in st.session_state:
 
 # ── 計算実行 ─────────────────────────────────────────────────────────────────
 if run_btn:
-    prog_bar   = st.progress(0, text="計算を開始しています...")
-    all_visible = []
-    all_sectors = []
+    _n_bb     = len(bb_df_w)
+    prog_bar  = st.progress(0, text="計算を開始しています...")
+    all_visible = [None] * _n_bb
+    all_sectors = [None] * _n_bb
+    _done = [0]
 
-    for i, row in bb_df_w.iterrows():
-        bb = row.to_dict()
+    def _calc_one(args):
+        idx, bb = args
+        return idx, compute_visibility(bb, buildings_gdf)
 
-        def progress_cb(frac, text, _i=i):
-            prog_bar.progress((_i + frac) / len(bb_df_w), text=text)
-
-        vdf, sector, total = compute_visibility(bb, buildings_gdf, progress_cb)
-        all_visible.append(vdf)
-        all_sectors.append(sector)
+    with ThreadPoolExecutor(max_workers=min(_n_bb, 6)) as _ex:
+        _futs = {_ex.submit(_calc_one, (idx, row.to_dict())): idx
+                 for idx, (_, row) in enumerate(bb_df_w.iterrows())}
+        for _fut in as_completed(_futs):
+            idx, (vdf, sector, _) = _fut.result()
+            all_visible[idx] = vdf
+            all_sectors[idx] = sector
+            _done[0] += 1
+            prog_bar.progress(_done[0] / _n_bb, text=f"{_done[0]}/{_n_bb} 面完了")
 
     prog_bar.progress(1.0, text="完了！")
 
@@ -1328,13 +1371,13 @@ if "result_df" in st.session_state:
     st.divider()
     st.subheader("📊 計算結果")
 
-    cols = st.columns(max(len(bb_list), 1))
+    cols = st.columns(min(len(bb_list), 4))
     for idx, (bb, vdf) in enumerate(zip(bb_list, all_visible)):
         with cols[idx % len(cols)]:
             st.metric(
                 label=str(bb["screen_id"]),
                 value=f"{len(vdf):,} メッシュ",
-                help=f"方位 {bb['facing_deg']}° / 高さ {bb['height_m']}m / 面 {bb.get('panel_h_m','?')}×{bb.get('panel_w_m','?')}m / 最大視認距離 {bb.get('max_range_m','?')}m",
+                help=f"方位 {bb['facing_deg']}° / 高さ {bb['height_m']}m / 面 {bb.get('panel_h_mm','?')}×{bb.get('panel_w_mm','?')}mm / 最大視認距離 {bb.get('max_range_m','?')}m",
             )
 
     if not result_df.empty:
@@ -1353,22 +1396,24 @@ if "result_df" in st.session_state:
         for _i, _bb in enumerate(bb_list):
             _s = str(_bb["screen_id"])
             with _fcols[_i % min(_n_bb, 4)]:
-                _show[_s]  = st.checkbox(
-                    f"表示: {_s}", value=True, key=f"show_{_s}"
+                _show[_i]  = st.checkbox(
+                    f"表示: {_s}", value=True, key=f"show_{_i}"
                 )
-                _mcols[_s] = st.color_picker(
+                _mcols[_i] = st.color_picker(
                     f"メッシュ色: {_s}",
                     value=COLORS[_i % len(COLORS)],
-                    key=f"meshcol_{_s}",
+                    key=f"meshcol_{_i}",
                 )
 
-    # フィルタ適用
-    _fbb  = [bb  for bb       in bb_list    if _show.get(str(bb["screen_id"]),  True)]
-    _fvis = [vdf for bb, vdf  in zip(bb_list, all_visible) if _show.get(str(bb["screen_id"]), True)]
-    _fsec = [sec for bb, sec  in zip(bb_list, all_sectors) if _show.get(str(bb["screen_id"]), True)]
+    # フィルタ適用（インデックスベースで重複 screen_id に対応）
+    _fbb  = [bb  for i, bb  in enumerate(bb_list)                          if _show.get(i, True)]
+    _fvis = [vdf for i, (bb, vdf) in enumerate(zip(bb_list, all_visible)) if _show.get(i, True)]
+    _fsec = [sec for i, (bb, sec) in enumerate(zip(bb_list, all_sectors)) if _show.get(i, True)]
+    _fmcols = {new_i: _mcols[old_i]
+               for new_i, old_i in enumerate(i for i, bb in enumerate(bb_list) if _show.get(i, True))}
 
     with st.spinner("地図を生成中..."):
-        fig = build_map(_fbb, _fsec, _fvis, buildings_calc, mesh_colors=_mcols)
+        fig = build_map(_fbb, _fsec, _fvis, buildings_calc, mesh_colors=_fmcols)
     st.plotly_chart(fig, use_container_width=True)
 
     # ── 視線遮蔽建物の除外補正 ────────────────────────────────────────────────
@@ -1522,14 +1567,24 @@ if "result_df" in st.session_state:
                 else None
             )
             _rprog = st.progress(0, text="再計算中...")
-            _new_visible_r: list = []
-            _new_sectors_r: list = []
-            for _ri, _rbb in enumerate(bb_list):
-                def _rcb(frac, text, _i=_ri):
-                    _rprog.progress((_i + frac) / len(bb_list), text=text)
-                _rvdf, _rsec, _ = compute_visibility(_rbb, _filtered_bldgs, _rcb)
-                _new_visible_r.append(_rvdf)
-                _new_sectors_r.append(_rsec)
+            _rn    = len(bb_list)
+            _new_visible_r = [None] * _rn
+            _new_sectors_r = [None] * _rn
+            _rdone = [0]
+
+            def _rcalc_one(args):
+                _ri, _rbb = args
+                return _ri, compute_visibility(_rbb, _filtered_bldgs)
+
+            with ThreadPoolExecutor(max_workers=min(_rn, 6)) as _rex:
+                _rfuts = {_rex.submit(_rcalc_one, (_ri, _rbb)): _ri
+                          for _ri, _rbb in enumerate(bb_list)}
+                for _rfut in as_completed(_rfuts):
+                    _ri, (_rvdf, _rsec, _) = _rfut.result()
+                    _new_visible_r[_ri] = _rvdf
+                    _new_sectors_r[_ri] = _rsec
+                    _rdone[0] += 1
+                    _rprog.progress(_rdone[0] / _rn, text=f"{_rdone[0]}/{_rn} 面完了")
             _rprog.progress(1.0, text="再計算完了！")
             st.session_state["result_df"] = (
                 pd.concat(_new_visible_r, ignore_index=True)
