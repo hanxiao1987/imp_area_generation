@@ -8,6 +8,7 @@ import warnings
 import re
 import struct
 import zlib
+import zipfile
 import urllib.request
 import json as _json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -722,7 +723,9 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
 
 def build_map(billboards: list, sectors: list, visible_dfs: list,
               buildings_gdf: Optional[gpd.GeoDataFrame],
-              mesh_colors: Optional[dict] = None) -> go.Figure:
+              mesh_colors: Optional[dict] = None,
+              focus_center: Optional[tuple] = None,
+              focus_zoom: int = 16) -> go.Figure:
     fig = go.Figure()
 
     if buildings_gdf is not None and not buildings_gdf.empty:
@@ -864,11 +867,14 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                            f"方位: {facing}°<extra></extra>"),
         ))
 
-    center_lat = np.mean([bb["latitude"]  for bb in billboards])
-    center_lon = np.mean([bb["longitude"] for bb in billboards])
+    if focus_center:
+        center_lat, center_lon = focus_center
+    else:
+        center_lat = np.mean([bb["latitude"]  for bb in billboards])
+        center_lon = np.mean([bb["longitude"] for bb in billboards])
     fig.update_layout(
         mapbox=dict(style="open-street-map",
-                    center=dict(lat=center_lat, lon=center_lon), zoom=16),
+                    center=dict(lat=center_lat, lon=center_lon), zoom=focus_zoom),
         height=680,
         margin=dict(r=0, t=0, l=0, b=0),
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
@@ -1163,11 +1169,29 @@ for idx, row in bb_df_w.iterrows():
         hovertemplate=f"<b>{row.screen_id}</b><br>高さ: {row.height_m}m<br>方位: {row.facing_deg}°<extra></extra>",
     ))
 
-center_lat = bb_df_w["latitude"].mean()
-center_lon = bb_df_w["longitude"].mean()
+_prev_focus_opts = ["全表示"] + [
+    f"{str(row.screen_id)}  ({row.facing_deg}°)"
+    for _, row in bb_df_w.iterrows()
+]
+_prev_focus_sel = st.selectbox(
+    "🎯 フォーカス（選択するとマップがその面へ移動）",
+    _prev_focus_opts,
+    key="prev_map_focus",
+)
+if _prev_focus_sel != "全表示":
+    _prev_idx  = _prev_focus_opts.index(_prev_focus_sel) - 1
+    _prev_row  = bb_df_w.iloc[_prev_idx]
+    center_lat = float(_prev_row["latitude"])
+    center_lon = float(_prev_row["longitude"])
+    _prev_zoom = 18
+else:
+    center_lat = bb_df_w["latitude"].mean()
+    center_lon = bb_df_w["longitude"].mean()
+    _prev_zoom = 16
+
 prev_fig.update_layout(
     mapbox=dict(style="open-street-map",
-                center=dict(lat=center_lat, lon=center_lon), zoom=16),
+                center=dict(lat=center_lat, lon=center_lon), zoom=_prev_zoom),
     height=420, margin=dict(r=0, t=0, l=0, b=0),
     legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
                 bgcolor="rgba(255,255,255,0.88)"),
@@ -1194,10 +1218,13 @@ else:
             help="選択した面のマーカーが赤くなります。地図上をクリックして新しい位置を指定してください。",
         )
 
-    # Folium マップ構築
+    # Folium マップ構築（選択面の補正座標へ移動）
+    _sel_center = _corr.get(_sel, {})
+    _fm_lat = _sel_center.get("latitude", bb_df_w["latitude"].mean())
+    _fm_lon = _sel_center.get("longitude", bb_df_w["longitude"].mean())
     _fm = folium.Map(
-        location=[bb_df_w["latitude"].mean(), bb_df_w["longitude"].mean()],
-        zoom_start=16,
+        location=[_fm_lat, _fm_lon],
+        zoom_start=18,
         tiles="OpenStreetMap",
     )
     for _fi, _fr in bb_df_w.iterrows():
@@ -1389,6 +1416,17 @@ if "result_df" in st.session_state:
 
     # ── 地図表示設定（フィルター + メッシュ色） ──────────────────────────
     with st.expander("🎛️ 地図表示設定", expanded=True):
+        # Screen_id フォーカスフィルター
+        _focus_opts = ["全表示"] + [
+            f"{str(_bb['screen_id'])}  ({_bb['facing_deg']}°)"
+            for _bb in bb_list
+        ]
+        _focus_sel = st.selectbox(
+            "🎯 フォーカス（選択すると地図がそのDOOHへ移動）",
+            _focus_opts,
+            key="map_focus",
+        )
+
         _n_bb  = len(bb_list)
         _fcols = st.columns(min(_n_bb, 4))
         _show  = {}
@@ -1405,6 +1443,15 @@ if "result_df" in st.session_state:
                     key=f"meshcol_{_i}",
                 )
 
+    # フォーカス設定を解決
+    _focus_center = None
+    _focus_zoom   = 16
+    if _focus_sel != "全表示":
+        _focus_idx    = _focus_opts.index(_focus_sel) - 1  # "全表示" の分を引く
+        _focus_bb     = bb_list[_focus_idx]
+        _focus_center = (_focus_bb["latitude"], _focus_bb["longitude"])
+        _focus_zoom   = 18
+
     # フィルタ適用（インデックスベースで重複 screen_id に対応）
     _fbb  = [bb  for i, bb  in enumerate(bb_list)                          if _show.get(i, True)]
     _fvis = [vdf for i, (bb, vdf) in enumerate(zip(bb_list, all_visible)) if _show.get(i, True)]
@@ -1413,7 +1460,10 @@ if "result_df" in st.session_state:
                for new_i, old_i in enumerate(i for i, bb in enumerate(bb_list) if _show.get(i, True))}
 
     with st.spinner("地図を生成中..."):
-        fig = build_map(_fbb, _fsec, _fvis, buildings_calc, mesh_colors=_fmcols)
+        fig = build_map(_fbb, _fsec, _fvis, buildings_calc,
+                        mesh_colors=_fmcols,
+                        focus_center=_focus_center,
+                        focus_zoom=_focus_zoom)
     st.plotly_chart(fig, use_container_width=True)
 
     # ── 視線遮蔽建物の除外補正 ────────────────────────────────────────────────
@@ -1619,3 +1669,24 @@ if "result_df" in st.session_state:
                 )
     if not _dl_any:
         st.warning("有効メッシュが 0 件でした。設定を見直してください。")
+    else:
+        # 一括 ZIP ダウンロード
+        _zip_buf = io.BytesIO()
+        with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
+            for _i, (_bb, _vdf) in enumerate(zip(bb_list, all_visible)):
+                if not _vdf.empty:
+                    _sid = str(_bb["screen_id"])
+                    _zf.writestr(
+                        f"No.{_sid}.csv",
+                        _vdf["mesh_code"].to_csv(index=False, header=False),
+                    )
+        _zip_buf.seek(0)
+        st.download_button(
+            label="⬇️ 全面を一括ダウンロード (ZIP)",
+            data=_zip_buf.getvalue(),
+            file_name="mesh_codes_all.zip",
+            mime="application/zip",
+            key="dl_all_zip",
+            type="secondary",
+            use_container_width=False,
+        )
