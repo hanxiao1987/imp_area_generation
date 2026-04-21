@@ -1278,6 +1278,31 @@ else:
                 color="#e74c3c", weight=4, opacity=0.9,
                 tooltip=f"現在の向き: {_ffacing:.1f}°",
             ).add_to(_fm)
+            # 向きを設定モード: 矢印先端にドラッグ可能なハンドルを追加
+            if _corr_mode == "🧭 向きを設定":
+                _handle = folium.Marker(
+                    location=[_arr_end_lat, _arr_end_lon],
+                    icon=folium.DivIcon(
+                        html='<div style="width:20px;height:20px;background:#e74c3c;border-radius:50%;cursor:grab;border:3px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.5);"></div>',
+                        icon_size=(20, 20),
+                        icon_anchor=(10, 10),
+                    ),
+                    draggable=True,
+                    tooltip="ドラッグして向きを変更",
+                )
+                _handle.add_to(_fm)
+                _map_var    = _fm.get_name()
+                _handle_var = _handle.get_name()
+                _fm.get_root().html.add_child(folium.Element(
+                    f"<script>(function(){{"
+                    f"function _s(){{"
+                    f"var m=window['{_handle_var}'],p=window['{_map_var}'];"
+                    f"if(!m||!p){{setTimeout(_s,50);return;}}"
+                    f"m.on('dragend',function(e){{"
+                    f"var ll=e.target.getLatLng();"
+                    f"p.fire('click',{{latlng:ll,layerPoint:p.latLngToLayerPoint(ll),containerPoint:p.latLngToContainerPoint(ll)}});"
+                    f"}});}}_s();}})();</script>"
+                ))
 
     with _cc_map:
         _map_res = st_folium(
@@ -1323,7 +1348,7 @@ else:
                     st.success(f"✓ この向きに設定済みです ({_calc_deg:.1f}°)")
                 else:
                     st.info(
-                        f"🧭 **クリック方向**  \n"
+                        f"🧭 **ドラッグ方向**  \n"
                         f"方位角: `{_calc_deg:.1f}°`  \n"
                         f"現在: `{_cur_facing:.1f}°`"
                     )
@@ -1360,7 +1385,7 @@ else:
                         st.rerun()
         else:
             if _corr_mode == "🧭 向きを設定":
-                st.caption("地図上をクリックするとDOOHからその点への方位角を向きに設定できます")
+                st.caption("赤い矢印の先端（●）をドラッグして向きを設定できます")
             else:
                 st.caption("地図上をクリックすると新しい位置を指定できます")
 
