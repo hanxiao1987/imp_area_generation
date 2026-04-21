@@ -107,6 +107,15 @@ def local_scale(lat: float):
     return 111320.0, 111320.0 * math.cos(math.radians(lat))
 
 
+def _calc_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """2点間の方位角（北=0°、時計回り）を返す"""
+    dlon = math.radians(lon2 - lon1)
+    r1, r2 = math.radians(lat1), math.radians(lat2)
+    x = math.sin(dlon) * math.cos(r2)
+    y = math.cos(r1) * math.sin(r2) - math.sin(r1) * math.cos(r2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
 def create_sector(lat: float, lon: float, facing_deg: float,
                   radius_m: float = 500.0) -> Polygon:
     lat_sc, lon_sc = local_scale(lat)
@@ -1077,12 +1086,15 @@ st.success(f"広告面板 {len(bb_df)} 件を読み込みました")
 st.dataframe(bb_df, use_container_width=True)
 
 # ── 位置補正用: corrected_coords 初期化 (入力データが変わったらリセット) ──────
-_src_sig = bb_df[["screen_id", "latitude", "longitude"]].to_csv(index=False)
+_src_sig = bb_df[["screen_id", "latitude", "longitude", "facing_deg"]].to_csv(index=False)
 if st.session_state.get("_corr_src") != _src_sig:
     st.session_state["_corr_src"] = _src_sig
     st.session_state["corrected_coords"] = {
-        str(r["screen_id"]): {"latitude": float(r["latitude"]),
-                               "longitude": float(r["longitude"])}
+        str(r["screen_id"]): {
+            "latitude":   float(r["latitude"]),
+            "longitude":  float(r["longitude"]),
+            "facing_deg": float(r["facing_deg"]),
+        }
         for _, r in bb_df.iterrows()
     }
     if "finalized_master" in st.session_state:
@@ -1094,8 +1106,9 @@ bb_df_w = bb_df.copy()
 for _ci, _cr in bb_df_w.iterrows():
     _csid = str(_cr["screen_id"])
     if _csid in _corr:
-        bb_df_w.at[_ci, "latitude"]  = _corr[_csid]["latitude"]
-        bb_df_w.at[_ci, "longitude"] = _corr[_csid]["longitude"]
+        bb_df_w.at[_ci, "latitude"]   = _corr[_csid]["latitude"]
+        bb_df_w.at[_ci, "longitude"]  = _corr[_csid]["longitude"]
+        bb_df_w.at[_ci, "facing_deg"] = _corr[_csid].get("facing_deg", float(_cr["facing_deg"]))
 bb_df_w["max_range_m"] = (bb_df_w["panel_h_mm"] / 1000 * bb_df_w["panel_w_mm"] / 1000 * 7).round(1)
 
 # 建物データ（手動アップロード）
@@ -1212,10 +1225,16 @@ else:
 
     with _cc_ctrl:
         _sel = st.selectbox(
-            "移動する面を選択",
+            "補正する面を選択",
             _sids_all,
             key="corr_select",
-            help="選択した面のマーカーが赤くなります。地図上をクリックして新しい位置を指定してください。",
+            help="選択した面のマーカーが赤くなります。",
+        )
+        _corr_mode = st.radio(
+            "🖱️ クリックで補正する内容",
+            ["📍 位置を移動", "🧭 向きを設定"],
+            horizontal=True,
+            key="corr_mode",
         )
 
     # Folium マップ構築（選択面の補正座標へ移動）
@@ -1231,9 +1250,10 @@ else:
         _fsid  = str(_fr["screen_id"])
         _flat  = _corr[_fsid]["latitude"]
         _flon  = _corr[_fsid]["longitude"]
-        _fcolor = "red" if _fsid == _sel else "blue"
-        # 扇形
-        _fsec  = create_sector(_flat, _flon, _fr["facing_deg"], _fr["max_range_m"])
+        _fcolor   = "red" if _fsid == _sel else "blue"
+        _ffacing  = _corr[_fsid].get("facing_deg", float(_fr["facing_deg"]))
+        # 扇形（補正後の向きで描画）
+        _fsec  = create_sector(_flat, _flon, _ffacing, _fr["max_range_m"])
         folium.Polygon(
             locations=[[p[1], p[0]] for p in _fsec.exterior.coords],
             color=COLORS[_fi % len(COLORS)],
@@ -1247,6 +1267,17 @@ else:
             tooltip=f"{_fsid}（{_flat:.5f}, {_flon:.5f}）",
             icon=folium.Icon(color=_fcolor, icon="flag"),
         ).add_to(_fm)
+        # 選択面に方向矢印ラインを表示
+        if _fsid == _sel:
+            _arr_lat_sc, _arr_lon_sc = local_scale(_flat)
+            _arr_len = float(_fr["max_range_m"]) if float(_fr["max_range_m"]) > 10 else 30.0
+            _arr_end_lat = _flat + _arr_len * math.sin(math.radians(_ffacing)) / _arr_lat_sc
+            _arr_end_lon = _flon + _arr_len * math.cos(math.radians(90.0 - _ffacing)) / _arr_lon_sc
+            folium.PolyLine(
+                [[_flat, _flon], [_arr_end_lat, _arr_end_lon]],
+                color="#e74c3c", weight=4, opacity=0.9,
+                tooltip=f"現在の向き: {_ffacing:.1f}°",
+            ).add_to(_fm)
 
     with _cc_map:
         _map_res = st_folium(
@@ -1260,53 +1291,101 @@ else:
     with _cc_ctrl:
         _cur = _corr[_sel]
         # 元データと比較して変更検知
-        _orig_row = bb_df[bb_df["screen_id"].astype(str) == _sel].iloc[0]
+        _orig_row    = bb_df[bb_df["screen_id"].astype(str) == _sel].iloc[0]
+        _cur_facing  = _cur.get("facing_deg", float(_orig_row["facing_deg"]))
+        _orig_facing = float(_orig_row["facing_deg"])
         _is_moved = (
             abs(_cur["latitude"]  - float(_orig_row["latitude"]))  > 1e-7 or
-            abs(_cur["longitude"] - float(_orig_row["longitude"])) > 1e-7
+            abs(_cur["longitude"] - float(_orig_row["longitude"])) > 1e-7 or
+            abs(_cur_facing - _orig_facing) > 0.05
         )
         _status_icon = "✏️" if _is_moved else "📍"
         st.markdown(
-            f"**{_status_icon} {_sel} 現在位置**  \n"
+            f"**{_status_icon} {_sel} 現在値**  \n"
             f"緯度: `{_cur['latitude']:.6f}`  \n"
-            f"経度: `{_cur['longitude']:.6f}`"
+            f"経度: `{_cur['longitude']:.6f}`  \n"
+            f"方位角: `{_cur_facing:.1f}°`"
         )
+
+        # 方位角補正
+        st.markdown("**🧭 方位角補正**")
+        _new_facing = st.number_input(
+            "facing_deg (°)",
+            min_value=0.0, max_value=359.9,
+            value=_cur_facing,
+            step=1.0, format="%.1f",
+            key=f"facing_input_{_sel}",
+        )
+        if st.button("▶ 向きを適用", key="apply_facing", use_container_width=True, type="secondary"):
+            st.session_state["corrected_coords"][_sel]["facing_deg"] = float(_new_facing)
+            if "finalized_master" in st.session_state:
+                del st.session_state["finalized_master"]
+            st.rerun()
 
         # クリック位置の処理
         if _map_res and _map_res.get("last_clicked"):
             _clk_lat = round(_map_res["last_clicked"]["lat"], 7)
             _clk_lon = round(_map_res["last_clicked"]["lng"], 7)
-            _already = (
-                abs(_cur["latitude"]  - _clk_lat) < 1e-6 and
-                abs(_cur["longitude"] - _clk_lon) < 1e-6
-            )
-            if _already:
-                st.success(f"✓ この位置に移動済みです")
+
+            if _corr_mode == "🧭 向きを設定":
+                # 現在のDOOH位置からクリック点への方位角を計算
+                _bb_lat = _cur["latitude"]
+                _bb_lon = _cur["longitude"]
+                _calc_deg = _calc_bearing(_bb_lat, _bb_lon, _clk_lat, _clk_lon)
+                _cur_facing = _cur.get("facing_deg", float(_orig_row["facing_deg"]))
+                _already_facing = abs(_cur_facing - _calc_deg) < 0.1
+                if _already_facing:
+                    st.success(f"✓ この向きに設定済みです ({_calc_deg:.1f}°)")
+                else:
+                    st.info(
+                        f"🧭 **クリック方向**  \n"
+                        f"方位角: `{_calc_deg:.1f}°`  \n"
+                        f"現在: `{_cur_facing:.1f}°`"
+                    )
+                    if st.button(
+                        f"▶ {_sel} の向きを {_calc_deg:.1f}° に設定",
+                        key="apply_corr", type="secondary", use_container_width=True,
+                    ):
+                        st.session_state["corrected_coords"][_sel]["facing_deg"] = _calc_deg
+                        if "finalized_master" in st.session_state:
+                            del st.session_state["finalized_master"]
+                        st.rerun()
             else:
-                st.info(
-                    f"🔵 **クリック位置**  \n"
-                    f"緯度: `{_clk_lat}`  \n"
-                    f"経度: `{_clk_lon}`"
+                # 位置を移動モード
+                _already = (
+                    abs(_cur["latitude"]  - _clk_lat) < 1e-6 and
+                    abs(_cur["longitude"] - _clk_lon) < 1e-6
                 )
-                if st.button(
-                    f"▶ {_sel} をこの位置に移動",
-                    key="apply_corr", type="secondary", use_container_width=True,
-                ):
-                    st.session_state["corrected_coords"][_sel] = {
-                        "latitude": _clk_lat, "longitude": _clk_lon,
-                    }
-                    if "finalized_master" in st.session_state:
-                        del st.session_state["finalized_master"]
-                    st.rerun()
+                if _already:
+                    st.success(f"✓ この位置に移動済みです")
+                else:
+                    st.info(
+                        f"🔵 **クリック位置**  \n"
+                        f"緯度: `{_clk_lat}`  \n"
+                        f"経度: `{_clk_lon}`"
+                    )
+                    if st.button(
+                        f"▶ {_sel} をこの位置に移動",
+                        key="apply_corr", type="secondary", use_container_width=True,
+                    ):
+                        st.session_state["corrected_coords"][_sel]["latitude"] = _clk_lat
+                        st.session_state["corrected_coords"][_sel]["longitude"] = _clk_lon
+                        if "finalized_master" in st.session_state:
+                            del st.session_state["finalized_master"]
+                        st.rerun()
         else:
-            st.caption("地図上をクリックすると新しい位置を指定できます")
+            if _corr_mode == "🧭 向きを設定":
+                st.caption("地図上をクリックするとDOOHからその点への方位角を向きに設定できます")
+            else:
+                st.caption("地図上をクリックすると新しい位置を指定できます")
 
         # 個別リセット
         if _is_moved:
-            if st.button(f"↩ {_sel} の位置をリセット", key="reset_corr", use_container_width=True):
+            if st.button(f"↩ {_sel} の補正をリセット", key="reset_corr", use_container_width=True):
                 st.session_state["corrected_coords"][_sel] = {
-                    "latitude":  float(_orig_row["latitude"]),
-                    "longitude": float(_orig_row["longitude"]),
+                    "latitude":   float(_orig_row["latitude"]),
+                    "longitude":  float(_orig_row["longitude"]),
+                    "facing_deg": float(_orig_row["facing_deg"]),
                 }
                 if "finalized_master" in st.session_state:
                     del st.session_state["finalized_master"]
@@ -1315,10 +1394,15 @@ else:
         st.divider()
         st.markdown("**補正状況**")
         for _ss, _sp in _corr.items():
-            _or = bb_df[bb_df["screen_id"].astype(str) == _ss].iloc[0]
-            _mv = (abs(_sp["latitude"]  - float(_or["latitude"]))  > 1e-7 or
-                   abs(_sp["longitude"] - float(_or["longitude"])) > 1e-7)
-            st.caption(f"{'✏️' if _mv else '📍'} **{_ss}**: {_sp['latitude']:.5f}, {_sp['longitude']:.5f}")
+            _or  = bb_df[bb_df["screen_id"].astype(str) == _ss].iloc[0]
+            _spf = _sp.get("facing_deg", float(_or["facing_deg"]))
+            _mv  = (abs(_sp["latitude"]  - float(_or["latitude"]))  > 1e-7 or
+                    abs(_sp["longitude"] - float(_or["longitude"])) > 1e-7 or
+                    abs(_spf - float(_or["facing_deg"])) > 0.05)
+            st.caption(
+                f"{'✏️' if _mv else '📍'} **{_ss}**: "
+                f"{_sp['latitude']:.5f}, {_sp['longitude']:.5f} / {_spf:.1f}°"
+            )
 
 # ── 最終確定 ──────────────────────────────────────────────────────────────────
 st.divider()
@@ -1332,8 +1416,10 @@ with _fin_c1:
             _fs = str(_fr2["screen_id"])
             _fc = st.session_state.get("corrected_coords", {}).get(_fs)
             if _fc:
-                _fdf.at[_fi2, "latitude"]  = _fc["latitude"]
-                _fdf.at[_fi2, "longitude"] = _fc["longitude"]
+                _fdf.at[_fi2, "latitude"]   = _fc["latitude"]
+                _fdf.at[_fi2, "longitude"]  = _fc["longitude"]
+                if "facing_deg" in _fc:
+                    _fdf.at[_fi2, "facing_deg"] = _fc["facing_deg"]
         _fdf["max_range_m"] = (_fdf["panel_h_mm"] / 1000 * _fdf["panel_w_mm"] / 1000 * 7).round(1)
         st.session_state["finalized_master"] = _fdf
 
