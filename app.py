@@ -13,6 +13,8 @@ import urllib.request
 import json as _json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+from branca.element import MacroElement
+from jinja2 import Template
 
 import numpy as np
 import pandas as pd
@@ -898,6 +900,36 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
 
 st.set_page_config(page_title="広告視認エリア計算", page_icon="👁️", layout="wide")
 
+# ── 扇形ドラッグ向き補正ハンドラ ────────────────────────────────────────────
+class _PolygonDrag(MacroElement):
+    """Folium Polygon に追加すると mousedown→mouseup で合成 click を発火させる"""
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        (function(){
+            var ply={{ this._parent.get_name() }};
+            var mp ={{ this._parent._parent.get_name() }};
+            if(!ply||!mp) return;
+            if(ply._path) ply._path.style.cursor='grab';
+            ply.on('mousedown', function(e){
+                L.DomEvent.stopPropagation(e.originalEvent);
+                mp.dragging.disable();
+                if(ply._path) ply._path.style.cursor='grabbing';
+                function _up(eu){
+                    document.removeEventListener('mouseup', _up, true);
+                    mp.dragging.enable();
+                    if(ply._path) ply._path.style.cursor='grab';
+                    var rect=mp.getContainer().getBoundingClientRect(),
+                        pt=L.point(eu.clientX-rect.left, eu.clientY-rect.top),
+                        ll=mp.containerPointToLatLng(pt);
+                    mp.fire('click',{latlng:ll,layerPoint:mp.latLngToLayerPoint(ll),containerPoint:pt});
+                }
+                document.addEventListener('mouseup', _up, true);
+            });
+        })();
+        {% endmacro %}
+    """)
+
+
 # ── パスワード認証 ──────────────────────────────────────────────────────────
 def _check_password():
     if st.session_state.get("authenticated"):
@@ -1090,12 +1122,12 @@ _src_sig = bb_df[["screen_id", "latitude", "longitude", "facing_deg"]].to_csv(in
 if st.session_state.get("_corr_src") != _src_sig:
     st.session_state["_corr_src"] = _src_sig
     st.session_state["corrected_coords"] = {
-        str(r["screen_id"]): {
+        str(i): {
             "latitude":   float(r["latitude"]),
             "longitude":  float(r["longitude"]),
             "facing_deg": float(r["facing_deg"]),
         }
-        for _, r in bb_df.iterrows()
+        for i, r in bb_df.iterrows()
     }
     if "finalized_master" in st.session_state:
         del st.session_state["finalized_master"]
@@ -1104,11 +1136,11 @@ if st.session_state.get("_corr_src") != _src_sig:
 _corr = st.session_state["corrected_coords"]
 bb_df_w = bb_df.copy()
 for _ci, _cr in bb_df_w.iterrows():
-    _csid = str(_cr["screen_id"])
-    if _csid in _corr:
-        bb_df_w.at[_ci, "latitude"]   = _corr[_csid]["latitude"]
-        bb_df_w.at[_ci, "longitude"]  = _corr[_csid]["longitude"]
-        bb_df_w.at[_ci, "facing_deg"] = _corr[_csid].get("facing_deg", float(_cr["facing_deg"]))
+    _ckey = str(_ci)
+    if _ckey in _corr:
+        bb_df_w.at[_ci, "latitude"]   = _corr[_ckey]["latitude"]
+        bb_df_w.at[_ci, "longitude"]  = _corr[_ckey]["longitude"]
+        bb_df_w.at[_ci, "facing_deg"] = _corr[_ckey].get("facing_deg", float(_cr["facing_deg"]))
 bb_df_w["max_range_m"] = (bb_df_w["panel_h_mm"] / 1000 * bb_df_w["panel_w_mm"] / 1000 * 7).round(1)
 
 # 建物データ（手動アップロード）
@@ -1219,14 +1251,19 @@ st.subheader("✏️ 位置補正マップ")
 if not _FOLIUM_OK:
     st.warning("folium / streamlit-folium が未インストールです。`pip install folium streamlit-folium` を実行してください。")
 else:
-    _sids_all = [str(r["screen_id"]) for _, r in bb_df_w.iterrows()]
+    # キー: 行インデックス文字列, ラベル: "screen_id (facing°)"
+    _sel_opts = {
+        str(i): f"{str(r['screen_id'])}  ({float(r['facing_deg']):.0f}°)"
+        for i, r in bb_df_w.iterrows()
+    }
 
     _cc_map, _cc_ctrl = st.columns([3, 2])
 
     with _cc_ctrl:
         _sel = st.selectbox(
             "補正する面を選択",
-            _sids_all,
+            options=list(_sel_opts.keys()),
+            format_func=lambda k: _sel_opts[k],
             key="corr_select",
             help="選択した面のマーカーが赤くなります。",
         )
@@ -1247,22 +1284,22 @@ else:
         tiles="OpenStreetMap",
     )
     for _fi, _fr in bb_df_w.iterrows():
-        _fsid  = str(_fr["screen_id"])
-        _flat  = _corr[_fsid]["latitude"]
-        _flon  = _corr[_fsid]["longitude"]
-        _fcolor   = "red" if _fsid == _sel else "blue"
-        _ffacing  = _corr[_fsid].get("facing_deg", float(_fr["facing_deg"]))
+        _fi_key  = str(_fi)
+        _fsid    = str(_fr["screen_id"])
+        _flat    = _corr[_fi_key]["latitude"]
+        _flon    = _corr[_fi_key]["longitude"]
+        _fcolor  = "red" if _fi_key == _sel else "blue"
+        _ffacing = _corr[_fi_key].get("facing_deg", float(_fr["facing_deg"]))
         # 扇形（補正後の向きで描画）
-        _fsec  = create_sector(_flat, _flon, _ffacing, _fr["max_range_m"])
-        _poly_tip = (f"{_fsid}（ドラッグして向きを変更）"
-                     if _fsid == _sel and _corr_mode == "🧭 向きを設定"
-                     else f"{_fsid} 視認扇形")
-        _fpoly = folium.Polygon(
+        _fsec    = create_sector(_flat, _flon, _ffacing, _fr["max_range_m"])
+        _is_sel  = (_fi_key == _sel)
+        _fpoly   = folium.Polygon(
             locations=[[p[1], p[0]] for p in _fsec.exterior.coords],
             color=COLORS[_fi % len(COLORS)],
-            fill=True, fill_opacity=0.25 if (_fsid == _sel and _corr_mode == "🧭 向きを設定") else 0.10,
+            fill=True,
+            fill_opacity=0.25 if (_is_sel and _corr_mode == "🧭 向きを設定") else 0.10,
             weight=2,
-            tooltip=_poly_tip,
+            tooltip=f"{_fsid}（ドラッグして向きを変更）" if (_is_sel and _corr_mode == "🧭 向きを設定") else f"{_fsid} 視認扇形",
         )
         _fpoly.add_to(_fm)
         # マーカー
@@ -1273,7 +1310,7 @@ else:
             icon=folium.Icon(color=_fcolor, icon="flag"),
         ).add_to(_fm)
         # 選択面: 方向矢印と向きドラッグ設定
-        if _fsid == _sel:
+        if _is_sel:
             _arr_lat_sc, _arr_lon_sc = local_scale(_flat)
             _arr_len = float(_fr["max_range_m"]) if float(_fr["max_range_m"]) > 10 else 30.0
             _arr_end_lat = _flat + _arr_len * math.sin(math.radians(_ffacing)) / _arr_lat_sc
@@ -1283,29 +1320,9 @@ else:
                 color="#e74c3c", weight=4, opacity=0.9,
                 tooltip=f"現在の向き: {_ffacing:.1f}°",
             ).add_to(_fm)
-            # 向きを設定モード: 扇形ポリゴン自体をドラッグして方位角を変更
+            # 向きを設定モード: MacroElement で扇形ドラッグ→合成クリック
             if _corr_mode == "🧭 向きを設定":
-                _map_var  = _fm.get_name()
-                _poly_var = _fpoly.get_name()
-                _fm.get_root().html.add_child(folium.Element(
-                    f"<script>(function(){{"
-                    f"function _s(){{"
-                    f"var ply=window['{_poly_var}'],mp=window['{_map_var}'];"
-                    f"if(!ply||!mp){{setTimeout(_s,50);return;}}"
-                    f"if(ply._path)ply._path.style.cursor='grab';"
-                    f"ply.on('mousedown',function(e){{"
-                    f"L.DomEvent.stopPropagation(e.originalEvent);"
-                    f"mp.dragging.disable();"
-                    f"if(ply._path)ply._path.style.cursor='grabbing';"
-                    f"mp.on('mouseup',function(eu){{"
-                    f"mp.dragging.enable();"
-                    f"if(ply._path)ply._path.style.cursor='grab';"
-                    f"mp.off('mouseup');"
-                    f"mp.fire('click',{{latlng:eu.latlng,"
-                    f"layerPoint:mp.latLngToLayerPoint(eu.latlng),"
-                    f"containerPoint:mp.latLngToContainerPoint(eu.latlng)}});"
-                    f"}});}});}}_s();}})();</script>"
-                ))
+                _fpoly.add_child(_PolygonDrag())
 
     with _cc_map:
         _map_res = st_folium(
@@ -1317,9 +1334,10 @@ else:
         )
 
     with _cc_ctrl:
-        _cur = _corr[_sel]
+        _cur      = _corr[_sel]
+        _orig_row = bb_df.loc[int(_sel)]          # 行インデックスで直接取得
+        _sel_sid  = str(_orig_row["screen_id"])   # 表示用 screen_id
         # 元データと比較して変更検知
-        _orig_row    = bb_df[bb_df["screen_id"].astype(str) == _sel].iloc[0]
         _cur_facing  = _cur.get("facing_deg", float(_orig_row["facing_deg"]))
         _orig_facing = float(_orig_row["facing_deg"])
         _is_moved = (
@@ -1329,7 +1347,7 @@ else:
         )
         _status_icon = "✏️" if _is_moved else "📍"
         st.markdown(
-            f"**{_status_icon} {_sel} 現在値**  \n"
+            f"**{_status_icon} {_sel_sid} ({_cur_facing:.0f}°) 現在値**  \n"
             f"緯度: `{_cur['latitude']:.6f}`  \n"
             f"経度: `{_cur['longitude']:.6f}`  \n"
             f"方位角: `{_cur_facing:.1f}°`"
@@ -1353,7 +1371,7 @@ else:
                         f"現在: `{_cur_facing:.1f}°`"
                     )
                     if st.button(
-                        f"▶ {_sel} の向きを {_calc_deg:.1f}° に設定",
+                        f"▶ {_sel_sid} ({_orig_facing:.0f}°) の向きを {_calc_deg:.1f}° に設定",
                         key="apply_corr", type="secondary", use_container_width=True,
                     ):
                         st.session_state["corrected_coords"][_sel]["facing_deg"] = _calc_deg
@@ -1375,7 +1393,7 @@ else:
                         f"経度: `{_clk_lon}`"
                     )
                     if st.button(
-                        f"▶ {_sel} をこの位置に移動",
+                        f"▶ {_sel_sid} ({_orig_facing:.0f}°) をこの位置に移動",
                         key="apply_corr", type="secondary", use_container_width=True,
                     ):
                         st.session_state["corrected_coords"][_sel]["latitude"] = _clk_lat
@@ -1391,7 +1409,7 @@ else:
 
         # 個別リセット
         if _is_moved:
-            if st.button(f"↩ {_sel} の補正をリセット", key="reset_corr", use_container_width=True):
+            if st.button(f"↩ {_sel_sid} ({_orig_facing:.0f}°) の補正をリセット", key="reset_corr", use_container_width=True):
                 st.session_state["corrected_coords"][_sel] = {
                     "latitude":   float(_orig_row["latitude"]),
                     "longitude":  float(_orig_row["longitude"]),
@@ -1404,13 +1422,13 @@ else:
         st.divider()
         st.markdown("**補正状況**")
         for _ss, _sp in _corr.items():
-            _or  = bb_df[bb_df["screen_id"].astype(str) == _ss].iloc[0]
+            _or  = bb_df.loc[int(_ss)]
             _spf = _sp.get("facing_deg", float(_or["facing_deg"]))
             _mv  = (abs(_sp["latitude"]  - float(_or["latitude"]))  > 1e-7 or
                     abs(_sp["longitude"] - float(_or["longitude"])) > 1e-7 or
                     abs(_spf - float(_or["facing_deg"])) > 0.05)
             st.caption(
-                f"{'✏️' if _mv else '📍'} **{_ss}**: "
+                f"{'✏️' if _mv else '📍'} **{str(_or['screen_id'])} ({float(_or['facing_deg']):.0f}°)**: "
                 f"{_sp['latitude']:.5f}, {_sp['longitude']:.5f} / {_spf:.1f}°"
             )
 
@@ -1423,8 +1441,7 @@ with _fin_c1:
     if st.button("✅ 位置を最終確定する", type="primary", key="finalize_btn", use_container_width=True):
         _fdf = bb_df.copy()
         for _fi2, _fr2 in _fdf.iterrows():
-            _fs = str(_fr2["screen_id"])
-            _fc = st.session_state.get("corrected_coords", {}).get(_fs)
+            _fc = st.session_state.get("corrected_coords", {}).get(str(_fi2))
             if _fc:
                 _fdf.at[_fi2, "latitude"]   = _fc["latitude"]
                 _fdf.at[_fi2, "longitude"]  = _fc["longitude"]
