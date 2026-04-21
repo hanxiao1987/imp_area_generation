@@ -1254,12 +1254,17 @@ else:
         _ffacing  = _corr[_fsid].get("facing_deg", float(_fr["facing_deg"]))
         # 扇形（補正後の向きで描画）
         _fsec  = create_sector(_flat, _flon, _ffacing, _fr["max_range_m"])
-        folium.Polygon(
+        _poly_tip = (f"{_fsid}（ドラッグして向きを変更）"
+                     if _fsid == _sel and _corr_mode == "🧭 向きを設定"
+                     else f"{_fsid} 視認扇形")
+        _fpoly = folium.Polygon(
             locations=[[p[1], p[0]] for p in _fsec.exterior.coords],
             color=COLORS[_fi % len(COLORS)],
-            fill=True, fill_opacity=0.10, weight=2,
-            tooltip=f"{_fsid} 視認扇形",
-        ).add_to(_fm)
+            fill=True, fill_opacity=0.25 if (_fsid == _sel and _corr_mode == "🧭 向きを設定") else 0.10,
+            weight=2,
+            tooltip=_poly_tip,
+        )
+        _fpoly.add_to(_fm)
         # マーカー
         folium.Marker(
             location=[_flat, _flon],
@@ -1267,7 +1272,7 @@ else:
             tooltip=f"{_fsid}（{_flat:.5f}, {_flon:.5f}）",
             icon=folium.Icon(color=_fcolor, icon="flag"),
         ).add_to(_fm)
-        # 選択面に方向矢印ラインを表示
+        # 選択面: 方向矢印と向きドラッグ設定
         if _fsid == _sel:
             _arr_lat_sc, _arr_lon_sc = local_scale(_flat)
             _arr_len = float(_fr["max_range_m"]) if float(_fr["max_range_m"]) > 10 else 30.0
@@ -1278,30 +1283,28 @@ else:
                 color="#e74c3c", weight=4, opacity=0.9,
                 tooltip=f"現在の向き: {_ffacing:.1f}°",
             ).add_to(_fm)
-            # 向きを設定モード: 矢印先端にドラッグ可能なハンドルを追加
+            # 向きを設定モード: 扇形ポリゴン自体をドラッグして方位角を変更
             if _corr_mode == "🧭 向きを設定":
-                _handle = folium.Marker(
-                    location=[_arr_end_lat, _arr_end_lon],
-                    icon=folium.DivIcon(
-                        html='<div style="width:20px;height:20px;background:#e74c3c;border-radius:50%;cursor:grab;border:3px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.5);"></div>',
-                        icon_size=(20, 20),
-                        icon_anchor=(10, 10),
-                    ),
-                    draggable=True,
-                    tooltip="ドラッグして向きを変更",
-                )
-                _handle.add_to(_fm)
-                _map_var    = _fm.get_name()
-                _handle_var = _handle.get_name()
+                _map_var  = _fm.get_name()
+                _poly_var = _fpoly.get_name()
                 _fm.get_root().html.add_child(folium.Element(
                     f"<script>(function(){{"
                     f"function _s(){{"
-                    f"var m=window['{_handle_var}'],p=window['{_map_var}'];"
-                    f"if(!m||!p){{setTimeout(_s,50);return;}}"
-                    f"m.on('dragend',function(e){{"
-                    f"var ll=e.target.getLatLng();"
-                    f"p.fire('click',{{latlng:ll,layerPoint:p.latLngToLayerPoint(ll),containerPoint:p.latLngToContainerPoint(ll)}});"
-                    f"}});}}_s();}})();</script>"
+                    f"var ply=window['{_poly_var}'],mp=window['{_map_var}'];"
+                    f"if(!ply||!mp){{setTimeout(_s,50);return;}}"
+                    f"if(ply._path)ply._path.style.cursor='grab';"
+                    f"ply.on('mousedown',function(e){{"
+                    f"L.DomEvent.stopPropagation(e.originalEvent);"
+                    f"mp.dragging.disable();"
+                    f"if(ply._path)ply._path.style.cursor='grabbing';"
+                    f"mp.on('mouseup',function(eu){{"
+                    f"mp.dragging.enable();"
+                    f"if(ply._path)ply._path.style.cursor='grab';"
+                    f"mp.off('mouseup');"
+                    f"mp.fire('click',{{latlng:eu.latlng,"
+                    f"layerPoint:mp.latLngToLayerPoint(eu.latlng),"
+                    f"containerPoint:mp.latLngToContainerPoint(eu.latlng)}});"
+                    f"}});}});}}_s();}})();</script>"
                 ))
 
     with _cc_map:
@@ -1385,7 +1388,7 @@ else:
                         st.rerun()
         else:
             if _corr_mode == "🧭 向きを設定":
-                st.caption("赤い矢印の先端（●）をドラッグして向きを設定できます")
+                st.caption("扇形をドラッグして離した位置への方位角を向きに設定できます")
             else:
                 st.caption("地図上をクリックすると新しい位置を指定できます")
 
