@@ -1307,21 +1307,6 @@ else:
             f"方位角: `{_cur_facing:.1f}°`"
         )
 
-        # 方位角補正
-        st.markdown("**🧭 方位角補正**")
-        _new_facing = st.number_input(
-            "facing_deg (°)",
-            min_value=0.0, max_value=359.9,
-            value=_cur_facing,
-            step=1.0, format="%.1f",
-            key=f"facing_input_{_sel}",
-        )
-        if st.button("▶ 向きを適用", key="apply_facing", use_container_width=True, type="secondary"):
-            st.session_state["corrected_coords"][_sel]["facing_deg"] = float(_new_facing)
-            if "finalized_master" in st.session_state:
-                del st.session_state["finalized_master"]
-            st.rerun()
-
         # クリック位置の処理
         if _map_res and _map_res.get("last_clicked"):
             _clk_lat = round(_map_res["last_clicked"]["lat"], 7)
