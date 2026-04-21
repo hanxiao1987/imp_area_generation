@@ -1695,15 +1695,16 @@ if "result_df" in st.session_state:
                 key="excl_folium",
                 height=540,
                 use_container_width=True,
-                returned_objects=["last_object_clicked_tooltip"],
+                returned_objects=["last_object_clicked"],
             )
 
             # クリックされた建物を除外セットに追加 / 解除
-            if _emap_res and _emap_res.get("last_object_clicked_tooltip"):
-                _tip = str(_emap_res["last_object_clicked_tooltip"]).strip()
-                # tooltipは _idx の数値文字列のみ
+            # last_object_clicked は {"properties": {"_idx": "42", ...}} の形式
+            _loc = _emap_res.get("last_object_clicked") if _emap_res else None
+            if _loc and isinstance(_loc, dict):
+                _props = _loc.get("properties") or {}
                 try:
-                    _clicked_idx = int(_tip)
+                    _clicked_idx = int(str(_props.get("_idx", "")).strip())
                     if _clicked_idx in _bldg_idx_in_area:
                         _new_excl = set(st.session_state.get(_excl_key, set()))
                         if _clicked_idx in _new_excl:
