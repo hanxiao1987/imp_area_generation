@@ -1714,32 +1714,42 @@ if "result_df" in st.session_state:
                 key=_efm_key,
                 height=540,
                 use_container_width=True,
-                returned_objects=["last_object_clicked_tooltip"],
+                returned_objects=["last_clicked"],
             )
 
-            # クリックされた建物を除外セットに追加 / 解除
-            # GeoJsonTooltip は HTML で返るため re.sub でタグを除去して数値を抽出
-            _raw_tip = (_emap_res.get("last_object_clicked_tooltip") or "") if _emap_res else ""
-            if _raw_tip:
-                # "建物ID: 42\n高さ(m): 15.0" のような文字列から最初の整数を取得
-                _tip_clean = re.sub(r"<[^>]+>", "", str(_raw_tip))
-                _nums = re.findall(r"\b(\d+)\b", _tip_clean)
-                if _nums:
-                    _tip_sig = _raw_tip[:120]   # 二重処理防止用シグネチャ
-                    if _tip_sig != st.session_state.get("_excl_last_tip"):
-                        st.session_state["_excl_last_tip"] = _tip_sig
-                        try:
-                            _clicked_idx = int(_nums[0])
-                            if _clicked_idx in _bldg_idx_in_area:
-                                _new_excl = set(st.session_state.get(_excl_key, set()))
-                                if _clicked_idx in _new_excl:
-                                    _new_excl.discard(_clicked_idx)
-                                else:
-                                    _new_excl.add(_clicked_idx)
-                                st.session_state[_excl_key] = _new_excl
-                                st.rerun()
-                        except (ValueError, TypeError):
-                            pass
+            # クリックされた建物をサーバーサイドの Point-in-Polygon で特定
+            _lc = _emap_res.get("last_clicked") if _emap_res else None
+            if _lc:
+                _clk_sig = f"{_lc['lat']:.7f},{_lc['lng']:.7f}"
+                if _clk_sig != st.session_state.get("_excl_last_tip"):
+                    st.session_state["_excl_last_tip"] = _clk_sig
+                    _clk_pt = Point(_lc["lng"], _lc["lat"])
+                    _hit_idx = None
+                    try:
+                        _pip_cands = list(_bldgs_in_area.sindex.intersection(_clk_pt.bounds))
+                        # まず厳密な contains 判定
+                        for _pp in _pip_cands:
+                            _bidx = _bldgs_in_area.index[_pp]
+                            if _bldgs_in_area.geometry.iloc[_pp].contains(_clk_pt):
+                                _hit_idx = _bidx
+                                break
+                        # contains で見つからなければ近傍 (~5m) で最近傍
+                        if _hit_idx is None:
+                            for _pp in _pip_cands:
+                                _bidx = _bldgs_in_area.index[_pp]
+                                if _bldgs_in_area.geometry.iloc[_pp].distance(_clk_pt) < 0.00005:
+                                    _hit_idx = _bidx
+                                    break
+                    except Exception:
+                        pass
+                    if _hit_idx is not None and _hit_idx in _bldg_idx_in_area:
+                        _new_excl = set(st.session_state.get(_excl_key, set()))
+                        if _hit_idx in _new_excl:
+                            _new_excl.discard(_hit_idx)
+                        else:
+                            _new_excl.add(_hit_idx)
+                        st.session_state[_excl_key] = _new_excl
+                        st.rerun()
 
     # 除外設定がある場合は再計算ボタンを表示
     if _excl_set:
@@ -1750,10 +1760,16 @@ if "result_df" in st.session_state:
             key="recalc_excl_btn",
             use_container_width=False,
         ):
+            _orig_cnt = len(buildings_calc) if buildings_calc is not None else 0
             _filtered_bldgs = (
                 buildings_calc[~buildings_calc.index.isin(_excl_set)].copy()
                 if buildings_calc is not None
                 else None
+            )
+            _filt_cnt = len(_filtered_bldgs) if _filtered_bldgs is not None else 0
+            st.info(
+                f"🔍 除外前: {_orig_cnt:,} 棟 → 除外後: {_filt_cnt:,} 棟 "
+                f"（除外セット: {sorted(_excl_set)}）"
             )
             _rprog = st.progress(0, text="再計算中...")
             _rn    = len(bb_list)
