@@ -1598,6 +1598,8 @@ if "result_df" in st.session_state:
             use_container_width=True,
         ):
             st.session_state["exclusion_mode"] = not _excl_mode
+            st.session_state.pop("_excl_last_tip", None)
+            st.session_state.pop("_excl_focus_prev", None)
             st.rerun()
     if _excl_set:
         with _ec2:
@@ -1633,10 +1635,32 @@ if "result_df" in st.session_state:
                 "🔴 赤 = 除外済み（クリックで復活）　🔵 青 = 計算対象（クリックで除外）"
             )
 
-            _center_lat = np.mean([_b["latitude"]  for _b in bb_list])
-            _center_lon = np.mean([_b["longitude"] for _b in bb_list])
+            # ── フォーカスフィルター ──────────────────────────────────────────
+            _excl_focus_opts = ["全表示"] + [
+                f"{str(_ebb['screen_id'])}  ({float(_ebb['facing_deg']):.0f}°)"
+                for _ebb in bb_list
+            ]
+            _excl_focus_sel = st.selectbox(
+                "🎯 フォーカス", _excl_focus_opts, key="excl_map_focus"
+            )
+            if _excl_focus_sel != "全表示":
+                _excl_fi   = _excl_focus_opts.index(_excl_focus_sel) - 1
+                _ecenter_lat = float(bb_list[_excl_fi]["latitude"])
+                _ecenter_lon = float(bb_list[_excl_fi]["longitude"])
+                _ezoom = 18
+            else:
+                _ecenter_lat = np.mean([_b["latitude"]  for _b in bb_list])
+                _ecenter_lon = np.mean([_b["longitude"] for _b in bb_list])
+                _ezoom = 17
+            # フォーカスが変わったらクリック履歴をリセット
+            _efm_key = f"excl_folium_{_excl_focus_sel}"
+            if st.session_state.get("_excl_focus_prev") != _excl_focus_sel:
+                st.session_state["_excl_focus_prev"] = _excl_focus_sel
+                st.session_state.pop("_excl_last_tip", None)
+
             _efm = folium.Map(
-                location=[_center_lat, _center_lon], zoom_start=17, tiles="OpenStreetMap"
+                location=[_ecenter_lat, _ecenter_lon], zoom_start=_ezoom,
+                tiles="OpenStreetMap",
             )
 
             # 扇形エリアを薄く表示（フル扇形を使用）
@@ -1677,44 +1701,45 @@ if "result_df" in st.session_state:
                     "weight":      2         if f["properties"]["_idx"] in _es else 1,
                     "fillOpacity": 0.6       if f["properties"]["_idx"] in _es else 0.3,
                 },
-                # tooltip はホバー表示用（_idx を last_object_clicked.properties で取得）
                 tooltip=folium.GeoJsonTooltip(
-                    fields=["_idx"],
-                    aliases=[""],
-                    labels=False,
-                ),
-                popup=folium.GeoJsonPopup(
                     fields=["_idx", "height"],
                     aliases=["建物ID:", "高さ(m):"],
+                    labels=True,
                 ),
                 name="buildings",
             ).add_to(_efm)
 
             _emap_res = st_folium(
                 _efm,
-                key="excl_folium",
+                key=_efm_key,
                 height=540,
                 use_container_width=True,
-                returned_objects=["last_object_clicked"],
+                returned_objects=["last_object_clicked_tooltip"],
             )
 
             # クリックされた建物を除外セットに追加 / 解除
-            # last_object_clicked は {"properties": {"_idx": "42", ...}} の形式
-            _loc = _emap_res.get("last_object_clicked") if _emap_res else None
-            if _loc and isinstance(_loc, dict):
-                _props = _loc.get("properties") or {}
-                try:
-                    _clicked_idx = int(str(_props.get("_idx", "")).strip())
-                    if _clicked_idx in _bldg_idx_in_area:
-                        _new_excl = set(st.session_state.get(_excl_key, set()))
-                        if _clicked_idx in _new_excl:
-                            _new_excl.discard(_clicked_idx)
-                        else:
-                            _new_excl.add(_clicked_idx)
-                        st.session_state[_excl_key] = _new_excl
-                        st.rerun()
-                except (ValueError, TypeError):
-                    pass
+            # GeoJsonTooltip は HTML で返るため re.sub でタグを除去して数値を抽出
+            _raw_tip = (_emap_res.get("last_object_clicked_tooltip") or "") if _emap_res else ""
+            if _raw_tip:
+                # "建物ID: 42\n高さ(m): 15.0" のような文字列から最初の整数を取得
+                _tip_clean = re.sub(r"<[^>]+>", "", str(_raw_tip))
+                _nums = re.findall(r"\b(\d+)\b", _tip_clean)
+                if _nums:
+                    _tip_sig = _raw_tip[:120]   # 二重処理防止用シグネチャ
+                    if _tip_sig != st.session_state.get("_excl_last_tip"):
+                        st.session_state["_excl_last_tip"] = _tip_sig
+                        try:
+                            _clicked_idx = int(_nums[0])
+                            if _clicked_idx in _bldg_idx_in_area:
+                                _new_excl = set(st.session_state.get(_excl_key, set()))
+                                if _clicked_idx in _new_excl:
+                                    _new_excl.discard(_clicked_idx)
+                                else:
+                                    _new_excl.add(_clicked_idx)
+                                st.session_state[_excl_key] = _new_excl
+                                st.rerun()
+                        except (ValueError, TypeError):
+                            pass
 
     # 除外設定がある場合は再計算ボタンを表示
     if _excl_set:
