@@ -1231,7 +1231,7 @@ else:
             help="選択した面のマーカーが赤くなります。",
         )
         _corr_mode = st.radio(
-            "🖱️ クリックで補正する内容",
+            "🖱️ 補正モード",
             ["📍 位置を移動", "🧭 向きを設定"],
             horizontal=True,
             key="corr_mode",
@@ -1341,11 +1341,8 @@ else:
             _clk_lon = round(_map_res["last_clicked"]["lng"], 7)
 
             if _corr_mode == "🧭 向きを設定":
-                # 現在のDOOH位置からクリック点への方位角を計算
-                _bb_lat = _cur["latitude"]
-                _bb_lon = _cur["longitude"]
-                _calc_deg = _calc_bearing(_bb_lat, _bb_lon, _clk_lat, _clk_lon)
-                _cur_facing = _cur.get("facing_deg", float(_orig_row["facing_deg"]))
+                # DOOHの現在位置からドラッグ終了点への方位角を計算
+                _calc_deg = _calc_bearing(_cur["latitude"], _cur["longitude"], _clk_lat, _clk_lon)
                 _already_facing = abs(_cur_facing - _calc_deg) < 0.1
                 if _already_facing:
                     st.success(f"✓ この向きに設定済みです ({_calc_deg:.1f}°)")
