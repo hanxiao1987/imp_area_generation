@@ -1677,7 +1677,7 @@ if "result_df" in st.session_state:
                     "weight":      2         if f["properties"]["_idx"] in _es else 1,
                     "fillOpacity": 0.6       if f["properties"]["_idx"] in _es else 0.3,
                 },
-                # tooltip は _idx のみ（last_object_clicked_tooltip でパース）
+                # tooltip はホバー表示用（_idx を last_object_clicked.properties で取得）
                 tooltip=folium.GeoJsonTooltip(
                     fields=["_idx"],
                     aliases=[""],
