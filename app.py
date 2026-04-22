@@ -671,6 +671,9 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
     mesh_area = lat_sz * lon_sz  # 全メッシュ面積は共通
 
     visible_rows = []
+    candidate_rows = []
+    n_area = 0   # 面積判定を通過したメッシュ数
+    n_los  = 0   # LOSチェックで除外されたメッシュ数
     for m in mesh_boxes:
         mesh_box = m["box"]
 
@@ -680,7 +683,28 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
             continue
         area_ratio = inter.area / mesh_area
         if area_ratio < VISIBLE_RATIO_THRESHOLD:
+            # 候補メッシュ: 1%以上のオーバーラップがあればLOSチェックして収集
+            if area_ratio >= 0.01:
+                _cand_blocked = False
+                if bldgs is not None and sindex is not None:
+                    _cpt = (inter.centroid.x, inter.centroid.y)
+                    _cray = LineString([(lon, lat), _cpt])
+                    _ccands = bldgs.iloc[list(sindex.intersection(_cray.bounds))]
+                    _cand_blocked = _is_blocked(lon, lat, h, _cpt[0], _cpt[1],
+                                                EYE_HEIGHT_M, _ccands, lat_sc, lon_sc)
+                if not _cand_blocked:
+                    _cdx = (m["lon"] - lon) * lon_sc
+                    _cdy = (m["lat"] - lat) * lat_sc
+                    candidate_rows.append({
+                        "billboard_id": sid,
+                        "mesh_code":    encode_mesh10(m["lat"], m["lon"]),
+                        "center_lat":   round(m["lat"], 8),
+                        "center_lon":   round(m["lon"], 8),
+                        "distance_m":   round(math.sqrt(_cdx**2 + _cdy**2), 1),
+                        "area_ratio":   round(area_ratio, 3),
+                    })
             continue
+        n_area += 1
 
         # ── 建物LOSチェック: SAMPLE_N 点全て遮蔽の場合のみ除外 ────────────
         if bldgs is not None and sindex is not None:
@@ -710,6 +734,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
                     all_blocked = False
                     break
             if all_blocked:
+                n_los += 1
                 continue
 
         code   = encode_mesh10(m["lat"], m["lon"])
@@ -725,7 +750,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
             "area_ratio":   round(area_ratio, 3),
         })
 
-    return pd.DataFrame(visible_rows), eff_sector, total
+    return pd.DataFrame(visible_rows), pd.DataFrame(candidate_rows), eff_sector, total, n_area, n_los
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -736,7 +761,9 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
               buildings_gdf: Optional[gpd.GeoDataFrame],
               mesh_colors: Optional[dict] = None,
               focus_center: Optional[tuple] = None,
-              focus_zoom: int = 16) -> go.Figure:
+              focus_zoom: int = 16,
+              candidates_dfs=None,
+              activated_codes=None) -> go.Figure:
     fig = go.Figure()
 
     if buildings_gdf is not None and not buildings_gdf.empty:
@@ -857,6 +884,60 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                 hovertemplate="%{text}<extra></extra>",
             ))
 
+        # 候補メッシュ（緑、クリック用マーカーつき）
+        if candidates_dfs and idx < len(candidates_dfs):
+            cdf = candidates_dfs[idx]
+            if cdf is not None and not cdf.empty:
+                _act_set = set(activated_codes or {})
+                _pending = cdf[~cdf["mesh_code"].isin(_act_set)]
+                if not _pending.empty:
+                    _cbox_lats, _cbox_lons = [], []
+                    for _, _cm in _pending.iterrows():
+                        _cla, _clo = _cm["center_lat"], _cm["center_lon"]
+                        _clat_sz, _clon_sz = lat_sz, lon_sz
+                        _cbox_lats += [_cla-_clat_sz/2, _cla+_clat_sz/2, _cla+_clat_sz/2, _cla-_clat_sz/2, _cla-_clat_sz/2, None]
+                        _cbox_lons += [_clo-_clon_sz/2, _clo-_clon_sz/2, _clo+_clon_sz/2, _clo+_clon_sz/2, _clo-_clon_sz/2, None]
+                    fig.add_trace(go.Scattermapbox(
+                        lat=_cbox_lats, lon=_cbox_lons,
+                        mode="lines", fill="toself",
+                        fillcolor="rgba(0,200,0,0.25)",
+                        line=dict(color="rgba(0,180,0,0.8)", width=1.5),
+                        name=f"{sid} 候補メッシュ (クリックで有効化)",
+                        hoverinfo="skip", showlegend=True,
+                    ))
+                    # クリック用マーカー（customdata=[bb_idx, mesh_code]）
+                    fig.add_trace(go.Scattermapbox(
+                        lat=_pending["center_lat"].tolist(),
+                        lon=_pending["center_lon"].tolist(),
+                        mode="markers",
+                        marker=dict(size=14, color="rgba(0,200,0,0.7)", symbol="circle"),
+                        customdata=[[idx, row["mesh_code"]] for _, row in _pending.iterrows()],
+                        name=f"{sid} 候補クリック",
+                        hovertemplate="<b>候補メッシュ</b><br>面積比: %{customdata[1]}<extra></extra>",
+                        showlegend=False,
+                    ))
+
+        # 有効化済みメッシュ（通常メッシュと同じ色）
+        if activated_codes and candidates_dfs and idx < len(candidates_dfs):
+            cdf = candidates_dfs[idx]
+            if cdf is not None and not cdf.empty:
+                _act_set = set(activated_codes or {})
+                _actdf = cdf[cdf["mesh_code"].isin(_act_set)]
+                if not _actdf.empty:
+                    _abox_lats, _abox_lons = [], []
+                    _act_col = mesh_colors.get(idx, color) if mesh_colors else color
+                    for _, _am in _actdf.iterrows():
+                        _ala, _alo = _am["center_lat"], _am["center_lon"]
+                        _abox_lats += [_ala-lat_sz/2, _ala+lat_sz/2, _ala+lat_sz/2, _ala-lat_sz/2, _ala-lat_sz/2, None]
+                        _abox_lons += [_alo-lon_sz/2, _alo-lon_sz/2, _alo+lon_sz/2, _alo+lon_sz/2, _alo-lon_sz/2, None]
+                    fig.add_trace(go.Scattermapbox(
+                        lat=_abox_lats, lon=_abox_lons,
+                        mode="lines", fill="toself",
+                        fillcolor=_hex_to_rgba(_act_col if _act_col.startswith("#") else color, 0.55),
+                        line=dict(color=_act_col if _act_col.startswith("#") else color, width=1.5),
+                        name=f"{sid} 手動追加メッシュ ({len(_actdf)}件)",
+                        hoverinfo="skip", showlegend=True,
+                    ))
 
         lat, lon = bb["latitude"], bb["longitude"]
         facing   = bb["facing_deg"]
@@ -1469,8 +1550,9 @@ if "finalized_master" in st.session_state:
 if run_btn:
     _n_bb     = len(bb_df_w)
     prog_bar  = st.progress(0, text="計算を開始しています...")
-    all_visible = [None] * _n_bb
-    all_sectors = [None] * _n_bb
+    all_visible    = [None] * _n_bb
+    all_sectors    = [None] * _n_bb
+    all_candidates = [None] * _n_bb
     _done = [0]
 
     def _calc_one(args):
@@ -1481,9 +1563,10 @@ if run_btn:
         _futs = {_ex.submit(_calc_one, (idx, row.to_dict())): idx
                  for idx, (_, row) in enumerate(bb_df_w.iterrows())}
         for _fut in as_completed(_futs):
-            idx, (vdf, sector, _) = _fut.result()
-            all_visible[idx] = vdf
-            all_sectors[idx] = sector
+            idx, (vdf, cdf, sector, _, __, ___) = _fut.result()
+            all_visible[idx]    = vdf
+            all_candidates[idx] = cdf
+            all_sectors[idx]    = sector
             _done[0] += 1
             prog_bar.progress(_done[0] / _n_bb, text=f"{_done[0]}/{_n_bb} 面完了")
 
@@ -1494,19 +1577,25 @@ if run_btn:
         if any(not v.empty for v in all_visible)
         else pd.DataFrame()
     )
-    st.session_state["result_df"]     = result_df
-    st.session_state["all_visible"]   = all_visible
-    st.session_state["all_sectors"]   = all_sectors
-    st.session_state["bb_list"]       = bb_df_w.to_dict("records")
-    st.session_state["buildings_calc"]= buildings_gdf
+    st.session_state["result_df"]       = result_df
+    st.session_state["all_visible"]     = all_visible
+    st.session_state["all_sectors"]     = all_sectors
+    st.session_state["all_candidates"]  = all_candidates
+    st.session_state["bb_list"]         = bb_df_w.to_dict("records")
+    st.session_state["buildings_calc"]  = buildings_gdf
+    st.session_state["buildings_orig"]  = buildings_gdf
+    st.session_state.pop("excl_applied", None)
+    st.session_state.pop("manual_activated", None)
 
 # ── 結果表示 ─────────────────────────────────────────────────────────────────
 if "result_df" in st.session_state:
-    result_df     = st.session_state["result_df"]
-    all_visible   = st.session_state["all_visible"]
-    all_sectors   = st.session_state["all_sectors"]
-    bb_list       = st.session_state["bb_list"]
-    buildings_calc= st.session_state["buildings_calc"]
+    result_df      = st.session_state["result_df"]
+    all_visible    = st.session_state["all_visible"]
+    all_sectors    = st.session_state["all_sectors"]
+    bb_list        = st.session_state["bb_list"]
+    buildings_calc = st.session_state["buildings_calc"]
+    # 除外補正適用済みのインデックスセット（再計算後に設定される）
+    _excl_applied  = st.session_state.get("excl_applied", frozenset())
 
     st.divider()
     st.subheader("📊 計算結果")
@@ -1572,12 +1661,95 @@ if "result_df" in st.session_state:
     _fmcols = {new_i: _mcols[old_i]
                for new_i, old_i in enumerate(i for i, bb in enumerate(bb_list) if _show.get(i, True))}
 
+    # 除外補正が適用済みならその建物をマップ表示からも除く
+    _bldgs_for_map = (
+        buildings_calc[~buildings_calc.index.isin(_excl_applied)].copy()
+        if buildings_calc is not None and _excl_applied
+        else buildings_calc
+    )
     with st.spinner("地図を生成中..."):
-        fig = build_map(_fbb, _fsec, _fvis, buildings_calc,
+        fig = build_map(_fbb, _fsec, _fvis, _bldgs_for_map,
                         mesh_colors=_fmcols,
                         focus_center=_focus_center,
                         focus_zoom=_focus_zoom)
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── 手動メッシュ補正 ────────────────────────────────────────────────────────
+    all_candidates = st.session_state.get("all_candidates")
+    _manual_activated = set(st.session_state.get("manual_activated", set()))
+    _fcat = None  # フィルタ済み候補リスト
+
+    if all_candidates:
+        _fcat = [all_candidates[old_i] if old_i < len(all_candidates) else None
+                 for old_i in (i for i, _ in enumerate(bb_list) if _show.get(i, True))]
+        _has_cands = any(c is not None and not c.empty for c in _fcat)
+    else:
+        _has_cands = False
+
+    if _has_cands or _manual_activated:
+        st.divider()
+        st.subheader("✏️ 手動メッシュ補正")
+        st.caption("緑のメッシュをクリックして有効化、最後に FIX ボタンで確定します。")
+
+        # インタラクティブマップ（候補 + 有効化済みを表示）
+        with st.spinner("マップ生成中..."):
+            _mfig = build_map(
+                _fbb, _fsec, _fvis, _bldgs_for_map,
+                mesh_colors=_fmcols,
+                focus_center=_focus_center,
+                focus_zoom=_focus_zoom,
+                candidates_dfs=_fcat,
+                activated_codes=_manual_activated,
+            )
+
+        _mevent = st.plotly_chart(
+            _mfig, key="manual_mesh_map",
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode=["points"],
+        )
+
+        # クリック処理: 候補マーカーがクリックされたら有効化/無効化
+        if _mevent and _mevent.selection and _mevent.selection.points:
+            for _pt in _mevent.selection.points:
+                _cd = _pt.get("customdata")
+                if _cd and len(_cd) >= 2:
+                    _bb_idx_c = int(_cd[0])
+                    _mc = str(_cd[1])
+                    if _mc in _manual_activated:
+                        _manual_activated.discard(_mc)
+                    else:
+                        _manual_activated.add(_mc)
+            st.session_state["manual_activated"] = _manual_activated
+            st.rerun()
+
+        # FIX ボタン
+        if _manual_activated:
+            _mc1, _mc2 = st.columns([3, 1])
+            with _mc1:
+                st.info(f"有効化済み: {len(_manual_activated)} 件のメッシュ")
+            with _mc2:
+                if st.button("✅ FIX（手動追加を確定）", type="primary", key="manual_fix_btn"):
+                    # 有効化メッシュを all_visible に統合
+                    _new_av = list(all_visible)
+                    for _bbi, _bb in enumerate(bb_list):
+                        if all_candidates and _bbi < len(all_candidates):
+                            _cdf = all_candidates[_bbi]
+                            if _cdf is not None and not _cdf.empty:
+                                _to_add = _cdf[_cdf["mesh_code"].isin(_manual_activated)]
+                                if not _to_add.empty:
+                                    _existing = _new_av[_bbi] if _new_av[_bbi] is not None else pd.DataFrame()
+                                    _merged = pd.concat([_existing, _to_add], ignore_index=True).drop_duplicates("mesh_code")
+                                    _new_av[_bbi] = _merged
+                    st.session_state["all_visible"] = _new_av
+                    st.session_state["result_df"] = (
+                        pd.concat(_new_av, ignore_index=True)
+                        if any(v is not None and not v.empty for v in _new_av)
+                        else pd.DataFrame()
+                    )
+                    st.session_state["manual_activated"] = set()
+                    st.session_state["all_candidates"] = None
+                    st.rerun()
 
     # ── 視線遮蔽建物の除外補正 ────────────────────────────────────────────────
     st.divider()
@@ -1598,7 +1770,7 @@ if "result_df" in st.session_state:
             use_container_width=True,
         ):
             st.session_state["exclusion_mode"] = not _excl_mode
-            st.session_state.pop("_excl_last_tip", None)
+            st.session_state.pop("_excl_last_clk", None)
             st.session_state.pop("_excl_focus_prev", None)
             st.rerun()
     if _excl_set:
@@ -1607,10 +1779,14 @@ if "result_df" in st.session_state:
         with _ec3:
             if st.button("🗑️ 除外リストをクリア", key="clear_excl", use_container_width=True):
                 st.session_state[_excl_key] = set()
+                st.session_state.pop("excl_applied", None)
                 st.rerun()
 
+    # 除外マップでは常に元の全建物データを使う（再計算後も再選択できるように）
+    _buildings_orig = st.session_state.get("buildings_orig", buildings_calc)
+
     if _excl_mode:
-        if buildings_calc is None or buildings_calc.empty:
+        if _buildings_orig is None or _buildings_orig.empty:
             st.warning("建物データがありません。建物データありで計算した場合のみ除外補正が使用できます。")
         elif not _FOLIUM_OK:
             st.warning("folium / streamlit-folium が未インストールです。`pip install folium streamlit-folium` を実行してください。")
@@ -1624,11 +1800,11 @@ if "result_df" in st.session_state:
                     _ebb["facing_deg"], _ebb.get("max_range_m", 500.0),
                 )
                 _full_sectors_excl.append(_fs)
-                _hits = buildings_calc[
-                    buildings_calc.geometry.intersects(_fs.buffer(0.00005))
+                _hits = _buildings_orig[
+                    _buildings_orig.geometry.intersects(_fs.buffer(0.00005))
                 ].index.tolist()
                 _bldg_idx_in_area.update(_hits)
-            _bldgs_in_area = buildings_calc.loc[sorted(_bldg_idx_in_area)].copy()
+            _bldgs_in_area = _buildings_orig.loc[sorted(_bldg_idx_in_area)].copy()
 
             st.caption(
                 f"対象エリア内の建物: {len(_bldgs_in_area):,} 棟　｜　"
@@ -1656,7 +1832,7 @@ if "result_df" in st.session_state:
             _efm_key = f"excl_folium_{_excl_focus_sel}"
             if st.session_state.get("_excl_focus_prev") != _excl_focus_sel:
                 st.session_state["_excl_focus_prev"] = _excl_focus_sel
-                st.session_state.pop("_excl_last_tip", None)
+                st.session_state.pop("_excl_last_clk", None)
 
             _efm = folium.Map(
                 location=[_ecenter_lat, _ecenter_lon], zoom_start=_ezoom,
@@ -1721,8 +1897,8 @@ if "result_df" in st.session_state:
             _lc = _emap_res.get("last_clicked") if _emap_res else None
             if _lc:
                 _clk_sig = f"{_lc['lat']:.7f},{_lc['lng']:.7f}"
-                if _clk_sig != st.session_state.get("_excl_last_tip"):
-                    st.session_state["_excl_last_tip"] = _clk_sig
+                if _clk_sig != st.session_state.get("_excl_last_clk"):
+                    st.session_state["_excl_last_clk"] = _clk_sig
                     _clk_pt = Point(_lc["lng"], _lc["lat"])
                     _hit_idx = None
                     try:
@@ -1751,6 +1927,10 @@ if "result_df" in st.session_state:
                         st.session_state[_excl_key] = _new_excl
                         st.rerun()
 
+    # 前回再計算の診断情報を表示
+    if "_recalc_diag" in st.session_state:
+        st.info(f"🔍 前回再計算: {st.session_state['_recalc_diag']}")
+
     # 除外設定がある場合は再計算ボタンを表示
     if _excl_set:
         st.divider()
@@ -1760,21 +1940,18 @@ if "result_df" in st.session_state:
             key="recalc_excl_btn",
             use_container_width=False,
         ):
-            _orig_cnt = len(buildings_calc) if buildings_calc is not None else 0
             _filtered_bldgs = (
                 buildings_calc[~buildings_calc.index.isin(_excl_set)].copy()
                 if buildings_calc is not None
                 else None
             )
+            _orig_cnt = len(buildings_calc) if buildings_calc is not None else 0
             _filt_cnt = len(_filtered_bldgs) if _filtered_bldgs is not None else 0
-            st.info(
-                f"🔍 除外前: {_orig_cnt:,} 棟 → 除外後: {_filt_cnt:,} 棟 "
-                f"（除外セット: {sorted(_excl_set)}）"
-            )
             _rprog = st.progress(0, text="再計算中...")
             _rn    = len(bb_list)
-            _new_visible_r = [None] * _rn
-            _new_sectors_r = [None] * _rn
+            _new_visible_r    = [None] * _rn
+            _new_sectors_r    = [None] * _rn
+            _new_candidates_r = [None] * _rn
             _rdone = [0]
 
             def _rcalc_one(args):
@@ -1784,13 +1961,27 @@ if "result_df" in st.session_state:
             with ThreadPoolExecutor(max_workers=min(_rn, 6)) as _rex:
                 _rfuts = {_rex.submit(_rcalc_one, (_ri, _rbb)): _ri
                           for _ri, _rbb in enumerate(bb_list)}
+                _new_stats_r = [None] * _rn
                 for _rfut in as_completed(_rfuts):
-                    _ri, (_rvdf, _rsec, _) = _rfut.result()
-                    _new_visible_r[_ri] = _rvdf
-                    _new_sectors_r[_ri] = _rsec
+                    _ri, (_rvdf, _rcdf, _rsec, _rtotal, _rarea, _rlos) = _rfut.result()
+                    _new_visible_r[_ri]    = _rvdf
+                    _new_candidates_r[_ri] = _rcdf
+                    _new_sectors_r[_ri]    = _rsec
+                    _new_stats_r[_ri]      = (_rtotal, _rarea, _rlos)
                     _rdone[0] += 1
                     _rprog.progress(_rdone[0] / _rn, text=f"{_rdone[0]}/{_rn} 面完了")
             _rprog.progress(1.0, text="再計算完了！")
+            # 診断情報を session_state に保存（rerun後も表示できるよう）
+            _diag_lines = [f"建物: {_orig_cnt}→{_filt_cnt}棟(除外{_orig_cnt-_filt_cnt}棟)"]
+            for _ri2, (_rbb2, _rvdf2, _rstat2) in enumerate(zip(bb_list, _new_visible_r, _new_stats_r)):
+                _sid2 = str(_rbb2.get("screen_id", _ri2))
+                _cnt2 = len(_rvdf2) if _rvdf2 is not None else -1
+                _t2, _a2, _l2 = _rstat2 if _rstat2 else (0, 0, 0)
+                _diag_lines.append(
+                    f"{_sid2}({_rbb2.get('facing_deg',0):.0f}°): "
+                    f"候補{_t2}→面積通過{_a2}→LOS除外{_l2}→可視{_cnt2}枚"
+                )
+            st.session_state["_recalc_diag"] = " ／ ".join(_diag_lines)
             st.session_state["result_df"] = (
                 pd.concat(_new_visible_r, ignore_index=True)
                 if any(not _v.empty for _v in _new_visible_r)
@@ -1798,46 +1989,61 @@ if "result_df" in st.session_state:
             )
             st.session_state["all_visible"]    = _new_visible_r
             st.session_state["all_sectors"]    = _new_sectors_r
+            st.session_state["all_candidates"] = _new_candidates_r
             st.session_state["exclusion_mode"] = False
+            # 適用済み除外セットを記録（マップ表示から除外建物を消すため）
+            st.session_state["excl_applied"]   = frozenset(_excl_set)
             st.rerun()
 
     # ── メッシュコード CSV ダウンロード ───────────────────────────────────────
     st.divider()
-    st.subheader("⬇️ メッシュコード CSV ダウンロード（面別）")
-    st.caption("各ファイルはメッシュコードのみ・ヘッダーなし。ファイル名は No.Screen ID です。")
-    _dl_any = False
-    _dl_cols = st.columns(min(len(bb_list), 4))
-    for _i, (_bb, _vdf) in enumerate(zip(bb_list, all_visible)):
+    st.subheader("⬇️ メッシュコード CSV ダウンロード（Screen ID別）")
+    st.caption("同一 Screen ID の複数向きを統合・重複除去・昇順ソート済み。ヘッダーなし。")
+
+    # screen_id ごとにメッシュコードを統合（重複除去・昇順ソート）
+    _sid_meshes: dict = {}
+    for _bb, _vdf in zip(bb_list, all_visible):
         _sid = str(_bb["screen_id"])
-        if not _vdf.empty:
-            _dl_any = True
-            _mesh_csv = _vdf["mesh_code"].to_csv(index=False, header=False).encode("utf-8")
-            with _dl_cols[_i % min(len(bb_list), 4)]:
-                st.download_button(
-                    label=f"⬇️ No.{_sid}.csv ({len(_vdf):,}件)",
-                    data=_mesh_csv,
-                    file_name=f"No.{_sid}.csv",
-                    mime="text/csv",
-                    key=f"dl_{_sid}_{_i}",
-                    type="primary",
-                    use_container_width=True,
-                )
+        if _vdf is not None and not _vdf.empty:
+            _sid_meshes.setdefault(_sid, []).append(_vdf["mesh_code"])
+
+    # 統合: 重複除去 → 昇順ソート
+    _sid_merged: dict = {}
+    for _sid, _parts in _sid_meshes.items():
+        _merged = pd.concat(_parts, ignore_index=True).drop_duplicates().sort_values().reset_index(drop=True)
+        _sid_merged[_sid] = _merged
+
+    _dl_any = bool(_sid_merged)
     if not _dl_any:
         st.warning("有効メッシュが 0 件でした。設定を見直してください。")
     else:
+        _unique_sids = list(_sid_merged.keys())
+        _dl_cols = st.columns(min(len(_unique_sids), 4))
+        for _ci, _sid in enumerate(_unique_sids):
+            _codes = _sid_merged[_sid]
+            _mesh_csv = _codes.to_csv(index=False, header=False).encode("utf-8")
+            with _dl_cols[_ci % min(len(_unique_sids), 4)]:
+                st.download_button(
+                    label=f"⬇️ No.{_sid}.csv ({len(_codes):,}件)",
+                    data=_mesh_csv,
+                    file_name=f"No.{_sid}.csv",
+                    mime="text/csv",
+                    key=f"dl_{_sid}",
+                    type="primary",
+                    use_container_width=True,
+                )
+
         # 一括 ZIP ダウンロード
         _zip_buf = io.BytesIO()
         with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
-            for _i, (_bb, _vdf) in enumerate(zip(bb_list, all_visible)):
-                if not _vdf.empty:
-                    _sid = str(_bb["screen_id"])
-                    _zf.writestr(
-                        f"No.{_sid}.csv",
-                        _vdf["mesh_code"].to_csv(index=False, header=False),
-                    )
+            for _sid, _codes in _sid_merged.items():
+                _zf.writestr(
+                    f"No.{_sid}.csv",
+                    _codes.to_csv(index=False, header=False),
+                )
         _zip_buf.seek(0)
         st.download_button(
-            label="⬇️ 全面を一括ダウンロード (ZIP)",
+            label="⬇️ 全 Screen ID を一括ダウンロード (ZIP)",
             data=_zip_buf.getvalue(),
             file_name="mesh_codes_all.zip",
             mime="application/zip",
