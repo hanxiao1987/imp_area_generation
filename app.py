@@ -1221,7 +1221,7 @@ for _ci, _cr in bb_df_w.iterrows():
     if _ckey in _corr:
         bb_df_w.at[_ci, "latitude"]   = _corr[_ckey]["latitude"]
         bb_df_w.at[_ci, "longitude"]  = _corr[_ckey]["longitude"]
-        bb_df_w.at[_ci, "facing_deg"] = _corr[_ckey].get("facing_deg", float(_cr["facing_deg"]))
+        bb_df_w.at[_ci, "facing_deg"] = int(_corr[_ckey].get("facing_deg", _cr["facing_deg"]))
 bb_df_w["max_range_m"] = (bb_df_w["panel_h_mm"] / 1000 * bb_df_w["panel_w_mm"] / 1000 * 7).round(1)
 
 # 建物データ（手動アップロード）
