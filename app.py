@@ -938,6 +938,18 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                         name=f"{sid} 手動追加メッシュ ({len(_actdf)}件)",
                         hoverinfo="skip", showlegend=True,
                     ))
+                    # 取り消し用マーカー（再クリックで有効化解除）
+                    fig.add_trace(go.Scattermapbox(
+                        lat=_actdf["center_lat"].tolist(),
+                        lon=_actdf["center_lon"].tolist(),
+                        mode="markers",
+                        marker=dict(size=14, color=_act_col if _act_col.startswith("#") else color,
+                                    symbol="circle", opacity=0.8),
+                        customdata=[[idx, row["mesh_code"]] for _, row in _actdf.iterrows()],
+                        name=f"{sid} 有効化済みクリック",
+                        hovertemplate="<b>有効化済み（再クリックで取消）</b><br>%{customdata[1]}<extra></extra>",
+                        showlegend=False,
+                    ))
 
         lat, lon = bb["latitude"], bb["longitude"]
         facing   = bb["facing_deg"]
@@ -1689,7 +1701,7 @@ if "result_df" in st.session_state:
     if _has_cands or _manual_activated:
         st.divider()
         st.subheader("✏️ 手動メッシュ補正")
-        st.caption("緑のメッシュをクリックして有効化、最後に FIX ボタンで確定します。")
+        st.caption("緑のメッシュをクリックして有効化、有効化済みメッシュを再クリックで取り消し、最後に FIX ボタンで確定します。")
 
         # インタラクティブマップ（候補 + 有効化済みを表示）
         with st.spinner("マップ生成中..."):
