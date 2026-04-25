@@ -1527,7 +1527,7 @@ with _fin_c1:
                 _fdf.at[_fi2, "latitude"]   = _fc["latitude"]
                 _fdf.at[_fi2, "longitude"]  = _fc["longitude"]
                 if "facing_deg" in _fc:
-                    _fdf.at[_fi2, "facing_deg"] = _fc["facing_deg"]
+                    _fdf.at[_fi2, "facing_deg"] = int(_fc["facing_deg"])
         _fdf["max_range_m"] = (_fdf["panel_h_mm"] / 1000 * _fdf["panel_w_mm"] / 1000 * 7).round(1)
         st.session_state["finalized_master"] = _fdf
 
