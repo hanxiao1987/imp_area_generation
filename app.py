@@ -763,7 +763,8 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
               focus_center: Optional[tuple] = None,
               focus_zoom: int = 16,
               candidates_dfs=None,
-              activated_codes=None) -> go.Figure:
+              activated_codes=None,
+              deactivated_codes=None) -> go.Figure:
     fig = go.Figure()
 
     if buildings_gdf is not None and not buildings_gdf.empty:
@@ -856,33 +857,76 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
 
         # 有効メッシュ: 中心点ではなく実寸のメッシュ矩形ポリゴンで描画
         # 建物の緑〜赤と被らないよう青系の色を使用
+        _edit_mode = candidates_dfs is not None
+        _deact_set = set(deactivated_codes or {})
         if not vdf.empty:
-            box_lats: list = []
-            box_lons: list = []
-            box_texts: list = []
-            for _, row in vdf.iterrows():
-                la0 = row["center_lat"] - lat_sz / 2
-                lo0 = row["center_lon"] - lon_sz / 2
-                txt = (f"{row['mesh_code']}<br>"
-                       f"距離: {row['distance_m']}m<br>"
-                       f"扇形内面積比: {row['area_ratio']*100:.1f}%")
-                # SW→SE→NE→NW→SW の順で閉じる
-                box_lats.extend([la0,          la0,          la0+lat_sz, la0+lat_sz, la0,          None])
-                box_lons.extend([lo0,          lo0+lon_sz,   lo0+lon_sz, lo0,        lo0,          None])
-                box_texts.extend([txt, txt, txt, txt, txt, ""])
-
             _mc = mesh_colors.get(idx) if mesh_colors else None
             _fc = _hex_to_rgba(_mc, 0.45) if _mc else "rgba(30,130,255,0.45)"
             _lc = _hex_to_rgba(_mc, 0.85) if _mc else "rgba(0,70,210,0.85)"
-            fig.add_trace(go.Scattermapbox(
-                lat=box_lats, lon=box_lons,
-                mode="lines", fill="toself",
-                fillcolor=_fc,
-                line=dict(color=_lc, width=1),
-                name=f"● {sid} 有効メッシュ ({len(vdf):,}件)",
-                text=box_texts,
-                hovertemplate="%{text}<extra></extra>",
-            ))
+
+            # アクティブなメッシュ（取り消し済みを除く）
+            _vdf_active = vdf[~vdf["mesh_code"].isin(_deact_set)]
+            if not _vdf_active.empty:
+                box_lats, box_lons, box_texts = [], [], []
+                for _, row in _vdf_active.iterrows():
+                    la0 = row["center_lat"] - lat_sz / 2
+                    lo0 = row["center_lon"] - lon_sz / 2
+                    txt = (f"{row['mesh_code']}<br>"
+                           f"距離: {row['distance_m']}m<br>"
+                           f"扇形内面積比: {row['area_ratio']*100:.1f}%")
+                    box_lats.extend([la0, la0, la0+lat_sz, la0+lat_sz, la0, None])
+                    box_lons.extend([lo0, lo0+lon_sz, lo0+lon_sz, lo0, lo0, None])
+                    box_texts.extend([txt, txt, txt, txt, txt, ""])
+                fig.add_trace(go.Scattermapbox(
+                    lat=box_lats, lon=box_lons,
+                    mode="lines", fill="toself",
+                    fillcolor=_fc,
+                    line=dict(color=_lc, width=1),
+                    name=f"● {sid} 有効メッシュ ({len(_vdf_active):,}件)",
+                    text=box_texts,
+                    hovertemplate="%{text}<extra></extra>",
+                ))
+                # 編集モード: 取り消し用マーカー
+                if _edit_mode:
+                    fig.add_trace(go.Scattermapbox(
+                        lat=_vdf_active["center_lat"].tolist(),
+                        lon=_vdf_active["center_lon"].tolist(),
+                        mode="markers",
+                        marker=dict(size=12, color=_lc, symbol="circle", opacity=0.7),
+                        customdata=[[idx, row["mesh_code"], "v"] for _, row in _vdf_active.iterrows()],
+                        name=f"{sid} 有効メッシュクリック",
+                        hovertemplate="<b>自動メッシュ（クリックで取消）</b><br>%{customdata[1]}<extra></extra>",
+                        showlegend=False,
+                    ))
+
+            # 取り消し済みメッシュ（グレーで表示）
+            _vdf_deact = vdf[vdf["mesh_code"].isin(_deact_set)]
+            if not _vdf_deact.empty:
+                d_lats, d_lons = [], []
+                for _, row in _vdf_deact.iterrows():
+                    la0 = row["center_lat"] - lat_sz / 2
+                    lo0 = row["center_lon"] - lon_sz / 2
+                    d_lats.extend([la0, la0, la0+lat_sz, la0+lat_sz, la0, None])
+                    d_lons.extend([lo0, lo0+lon_sz, lo0+lon_sz, lo0, lo0, None])
+                fig.add_trace(go.Scattermapbox(
+                    lat=d_lats, lon=d_lons,
+                    mode="lines", fill="toself",
+                    fillcolor="rgba(150,150,150,0.2)",
+                    line=dict(color="rgba(120,120,120,0.6)", width=1),
+                    name=f"{sid} 取り消し済み ({len(_vdf_deact)}件)",
+                    hoverinfo="skip", showlegend=True,
+                ))
+                # 再有効化マーカー
+                fig.add_trace(go.Scattermapbox(
+                    lat=_vdf_deact["center_lat"].tolist(),
+                    lon=_vdf_deact["center_lon"].tolist(),
+                    mode="markers",
+                    marker=dict(size=12, color="gray", symbol="circle", opacity=0.6),
+                    customdata=[[idx, row["mesh_code"], "v"] for _, row in _vdf_deact.iterrows()],
+                    name=f"{sid} 取り消し済みクリック",
+                    hovertemplate="<b>取り消し済み（再クリックで復元）</b><br>%{customdata[1]}<extra></extra>",
+                    showlegend=False,
+                ))
 
         # 候補メッシュ（緑、クリック用マーカーつき）
         if candidates_dfs and idx < len(candidates_dfs):
@@ -911,9 +955,9 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                         lon=_pending["center_lon"].tolist(),
                         mode="markers",
                         marker=dict(size=14, color="rgba(0,200,0,0.7)", symbol="circle"),
-                        customdata=[[idx, row["mesh_code"]] for _, row in _pending.iterrows()],
+                        customdata=[[idx, row["mesh_code"], "c"] for _, row in _pending.iterrows()],
                         name=f"{sid} 候補クリック",
-                        hovertemplate="<b>候補メッシュ</b><br>面積比: %{customdata[1]}<extra></extra>",
+                        hovertemplate="<b>候補メッシュ（クリックで有効化）</b><br>%{customdata[1]}<extra></extra>",
                         showlegend=False,
                     ))
 
@@ -945,9 +989,9 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
                         mode="markers",
                         marker=dict(size=14, color=_act_col if _act_col.startswith("#") else color,
                                     symbol="circle", opacity=0.8),
-                        customdata=[[idx, row["mesh_code"]] for _, row in _actdf.iterrows()],
+                        customdata=[[idx, row["mesh_code"], "c"] for _, row in _actdf.iterrows()],
                         name=f"{sid} 有効化済みクリック",
-                        hovertemplate="<b>有効化済み（再クリックで取消）</b><br>%{customdata[1]}<extra></extra>",
+                        hovertemplate="<b>手動追加済み（再クリックで取消）</b><br>%{customdata[1]}<extra></extra>",
                         showlegend=False,
                     ))
 
@@ -1597,7 +1641,8 @@ if run_btn:
     st.session_state["buildings_calc"]  = buildings_gdf
     st.session_state["buildings_orig"]  = buildings_gdf
     st.session_state.pop("excl_applied", None)
-    st.session_state.pop("manual_activated", None)
+    st.session_state.pop("manual_activated",   None)
+    st.session_state.pop("manual_deactivated", None)
 
 # ── 結果表示 ─────────────────────────────────────────────────────────────────
 if "result_df" in st.session_state:
@@ -1688,7 +1733,8 @@ if "result_df" in st.session_state:
 
     # ── 手動メッシュ補正 ────────────────────────────────────────────────────────
     all_candidates = st.session_state.get("all_candidates")
-    _manual_activated = set(st.session_state.get("manual_activated", set()))
+    _manual_activated   = set(st.session_state.get("manual_activated",   set()))
+    _manual_deactivated = set(st.session_state.get("manual_deactivated", set()))
     _fcat = None  # フィルタ済み候補リスト
 
     if all_candidates:
@@ -1698,10 +1744,10 @@ if "result_df" in st.session_state:
     else:
         _has_cands = False
 
-    if _has_cands or _manual_activated:
+    if _has_cands or _manual_activated or _manual_deactivated:
         st.divider()
         st.subheader("✏️ 手動メッシュ補正")
-        st.caption("緑のメッシュをクリックして有効化、有効化済みメッシュを再クリックで取り消し、最後に FIX ボタンで確定します。")
+        st.caption("自動メッシュをクリックで取り消し（グレー）→再クリックで復元。緑の候補メッシュをクリックで追加。FIX で確定。")
 
         # インタラクティブマップ（候補 + 有効化済みを表示）
         with st.spinner("マップ生成中..."):
@@ -1712,6 +1758,7 @@ if "result_df" in st.session_state:
                 focus_zoom=_focus_zoom,
                 candidates_dfs=_fcat,
                 activated_codes=_manual_activated,
+                deactivated_codes=_manual_deactivated,
             )
 
         _mevent = st.plotly_chart(
@@ -1721,29 +1768,50 @@ if "result_df" in st.session_state:
             selection_mode=["points"],
         )
 
-        # クリック処理: 候補マーカーがクリックされたら有効化/無効化
+        # クリック処理
         if _mevent and _mevent.selection and _mevent.selection.points:
             for _pt in _mevent.selection.points:
                 _cd = _pt.get("customdata")
                 if _cd and len(_cd) >= 2:
-                    _bb_idx_c = int(_cd[0])
-                    _mc = str(_cd[1])
-                    if _mc in _manual_activated:
-                        _manual_activated.discard(_mc)
+                    _mc   = str(_cd[1])
+                    _kind = str(_cd[2]) if len(_cd) >= 3 else "c"
+                    if _kind == "v":
+                        # 自動メッシュ: 取り消し / 復元トグル
+                        if _mc in _manual_deactivated:
+                            _manual_deactivated.discard(_mc)
+                        else:
+                            _manual_deactivated.add(_mc)
                     else:
-                        _manual_activated.add(_mc)
-            st.session_state["manual_activated"] = _manual_activated
+                        # 候補メッシュ: 有効化 / 取り消しトグル
+                        if _mc in _manual_activated:
+                            _manual_activated.discard(_mc)
+                        else:
+                            _manual_activated.add(_mc)
+            st.session_state["manual_activated"]   = _manual_activated
+            st.session_state["manual_deactivated"] = _manual_deactivated
             st.rerun()
 
         # FIX ボタン
-        if _manual_activated:
+        if _manual_activated or _manual_deactivated:
             _mc1, _mc2 = st.columns([3, 1])
             with _mc1:
-                st.info(f"有効化済み: {len(_manual_activated)} 件のメッシュ")
+                _info_parts = []
+                if _manual_activated:
+                    _info_parts.append(f"追加: {len(_manual_activated)}件")
+                if _manual_deactivated:
+                    _info_parts.append(f"取り消し: {len(_manual_deactivated)}件")
+                st.info(" ／ ".join(_info_parts))
             with _mc2:
-                if st.button("✅ FIX（手動追加を確定）", type="primary", key="manual_fix_btn"):
-                    # 有効化メッシュを all_visible に統合
+                if st.button("✅ FIX（手動補正を確定）", type="primary", key="manual_fix_btn"):
                     _new_av = list(all_visible)
+                    # 取り消し済みメッシュを削除
+                    if _manual_deactivated:
+                        for _bbi in range(len(_new_av)):
+                            if _new_av[_bbi] is not None and not _new_av[_bbi].empty:
+                                _new_av[_bbi] = _new_av[_bbi][
+                                    ~_new_av[_bbi]["mesh_code"].isin(_manual_deactivated)
+                                ]
+                    # 有効化メッシュを統合
                     for _bbi, _bb in enumerate(bb_list):
                         if all_candidates and _bbi < len(all_candidates):
                             _cdf = all_candidates[_bbi]
@@ -1759,8 +1827,9 @@ if "result_df" in st.session_state:
                         if any(v is not None and not v.empty for v in _new_av)
                         else pd.DataFrame()
                     )
-                    st.session_state["manual_activated"] = set()
-                    st.session_state["all_candidates"] = None
+                    st.session_state["manual_activated"]   = set()
+                    st.session_state["manual_deactivated"] = set()
+                    st.session_state["all_candidates"]     = None
                     st.rerun()
 
     # ── 視線遮蔽建物の除外補正 ────────────────────────────────────────────────
