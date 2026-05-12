@@ -353,24 +353,37 @@ def _gsi_reverse_geocode(lat: float, lon: float) -> Optional[str]:
 
 
 def _get_plateau_zip_url(dataset_id: str) -> Optional[str]:
-    """CKAN API で dataset_id → CityGML ZIP URL を取得 (v3 優先)"""
+    """CKAN API で dataset_id → 建物 CityGML ZIP URL を取得 (LOD2 優先)"""
     url = f"https://www.geospatial.jp/ckan/api/3/action/package_show?id={dataset_id}"
     try:
         with urllib.request.urlopen(url, timeout=15) as r:
             data = _json.loads(r.read())
         resources = data["result"]["resources"]
-        # v3 を優先し、なければ最初の CityGML zip
-        v3_url = None
+        # 建物(bldg/building)CityGML ZIPを優先度順に選択
+        # 2023+以降のリソース名は小文字 (citygml)、旧版は大文字 (CityGML) の場合あり
+        lod2_url = None
+        lod1_url = None
         fallback_url = None
         for res in resources:
             name = res.get("name", "")
             rurl = res.get("url", "")
-            if "CityGML" in name and rurl.endswith(".zip"):
-                if "v3" in name or "v3" in rurl:
-                    v3_url = rurl
+            name_l = name.lower()
+            rurl_l = rurl.lower()
+            # 建物 CityGML ZIP のみ対象（道路・植生等を除外）
+            is_bldg = ("bldg" in name_l or "building" in name_l or
+                       "bldg" in rurl_l or "building" in rurl_l)
+            is_citygml = "citygml" in name_l or "citygml" in rurl_l
+            is_zip = rurl_l.endswith(".zip")
+            if is_bldg and is_citygml and is_zip:
+                if "lod2" in name_l or "lod2" in rurl_l:
+                    if lod2_url is None:
+                        lod2_url = rurl
+                elif "lod1" in name_l or "lod1" in rurl_l:
+                    if lod1_url is None:
+                        lod1_url = rurl
                 elif fallback_url is None:
                     fallback_url = rurl
-        return v3_url or fallback_url
+        return lod2_url or lod1_url or fallback_url
     except Exception:
         return None
 
@@ -502,7 +515,9 @@ def auto_fetch_citygml(billboards_df: pd.DataFrame,
     # ④ 各市区町村の GML を取得
     all_gdfs = []
     for muni_cd in sorted(muni_cds):
-        dataset_id = catalog.get(muni_cd)
+        # 区レベルコード（末尾が0でない5桁）→ 市レベル(末尾0)へフォールバック
+        # 例: 23105(名古屋西区) → 23100(名古屋市), 14131(川崎区) → 14130(川崎市)
+        dataset_id = catalog.get(muni_cd) or catalog.get(muni_cd[:4] + "0")
         if not dataset_id:
             log(f"⚠️ 市区町村 {muni_cd} の Plateau データが見つかりません（対応エリア外の可能性）")
             continue
