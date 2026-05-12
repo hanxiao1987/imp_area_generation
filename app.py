@@ -643,7 +643,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
     eff_sector = sector.difference(dead_zone)
 
     if eff_sector.is_empty:
-        return pd.DataFrame(), eff_sector, 0
+        return pd.DataFrame(), pd.DataFrame(), eff_sector, 0
 
     # ── 有効扇形と交差するメッシュを列挙 ────────────────────────────────
     minlon, minlat, maxlon, maxlat = eff_sector.bounds
@@ -660,7 +660,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
     ]
     total = len(mesh_boxes)
     if total == 0:
-        return pd.DataFrame(), eff_sector, 0
+        return pd.DataFrame(), pd.DataFrame(), eff_sector, 0
 
     # ── 建物 sindex (LOS用) ────────────────────────────────────────────
     if buildings_gdf is not None and not buildings_gdf.empty:
