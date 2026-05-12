@@ -353,37 +353,26 @@ def _gsi_reverse_geocode(lat: float, lon: float) -> Optional[str]:
 
 
 def _get_plateau_zip_url(dataset_id: str) -> Optional[str]:
-    """CKAN API で dataset_id → 建物 CityGML ZIP URL を取得 (LOD2 優先)"""
+    """CKAN API で dataset_id → CityGML ZIP URL を取得 (v4 > v3 > v2 優先)"""
     url = f"https://www.geospatial.jp/ckan/api/3/action/package_show?id={dataset_id}"
     try:
         with urllib.request.urlopen(url, timeout=15) as r:
             data = _json.loads(r.read())
         resources = data["result"]["resources"]
-        # 建物(bldg/building)CityGML ZIPを優先度順に選択
-        # 2023+以降のリソース名は小文字 (citygml)、旧版は大文字 (CityGML) の場合あり
-        lod2_url = None
-        lod1_url = None
-        fallback_url = None
+        # リソース名は "CityGML（v4）" "CityGML（v3）" 等（大文字小文字混在）
+        v4_url = v3_url = fallback_url = None
         for res in resources:
             name = res.get("name", "")
             rurl = res.get("url", "")
             name_l = name.lower()
-            rurl_l = rurl.lower()
-            # 建物 CityGML ZIP のみ対象（道路・植生等を除外）
-            is_bldg = ("bldg" in name_l or "building" in name_l or
-                       "bldg" in rurl_l or "building" in rurl_l)
-            is_citygml = "citygml" in name_l or "citygml" in rurl_l
-            is_zip = rurl_l.endswith(".zip")
-            if is_bldg and is_citygml and is_zip:
-                if "lod2" in name_l or "lod2" in rurl_l:
-                    if lod2_url is None:
-                        lod2_url = rurl
-                elif "lod1" in name_l or "lod1" in rurl_l:
-                    if lod1_url is None:
-                        lod1_url = rurl
-                elif fallback_url is None:
-                    fallback_url = rurl
-        return lod2_url or lod1_url or fallback_url
+            if "citygml" in name_l and rurl.lower().endswith(".zip"):
+                if "v4" in name_l:
+                    v4_url = v4_url or rurl
+                elif "v3" in name_l:
+                    v3_url = v3_url or rurl
+                else:
+                    fallback_url = fallback_url or rurl
+        return v4_url or v3_url or fallback_url
     except Exception:
         return None
 
@@ -687,8 +676,6 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
 
     visible_rows = []
     candidate_rows = []
-    n_area = 0   # 面積判定を通過したメッシュ数
-    n_los  = 0   # LOSチェックで除外されたメッシュ数
     for m in mesh_boxes:
         mesh_box = m["box"]
 
@@ -719,8 +706,6 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
                         "area_ratio":   round(area_ratio, 3),
                     })
             continue
-        n_area += 1
-
         # ── 建物LOSチェック: SAMPLE_N 点全て遮蔽の場合のみ除外 ────────────
         if bldgs is not None and sindex is not None:
             # 重心を先頭に、メッシュ交差領域内に最大 SAMPLE_N 点をサンプリング
@@ -749,7 +734,6 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
                     all_blocked = False
                     break
             if all_blocked:
-                n_los += 1
                 continue
 
         code   = encode_mesh10(m["lat"], m["lon"])
@@ -765,7 +749,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
             "area_ratio":   round(area_ratio, 3),
         })
 
-    return pd.DataFrame(visible_rows), pd.DataFrame(candidate_rows), eff_sector, total, n_area, n_los
+    return pd.DataFrame(visible_rows), pd.DataFrame(candidate_rows), eff_sector, total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1634,7 +1618,7 @@ if run_btn:
         _futs = {_ex.submit(_calc_one, (idx, row.to_dict())): idx
                  for idx, (_, row) in enumerate(bb_df_w.iterrows())}
         for _fut in as_completed(_futs):
-            idx, (vdf, cdf, sector, _, __, ___) = _fut.result()
+            idx, (vdf, cdf, sector, _) = _fut.result()
             all_visible[idx]    = vdf
             all_candidates[idx] = cdf
             all_sectors[idx]    = sector
@@ -2023,10 +2007,6 @@ if "result_df" in st.session_state:
                         st.session_state[_excl_key] = _new_excl
                         st.rerun()
 
-    # 前回再計算の診断情報を表示
-    if "_recalc_diag" in st.session_state:
-        st.info(f"🔍 前回再計算: {st.session_state['_recalc_diag']}")
-
     # 除外設定がある場合は再計算ボタンを表示
     if _excl_set:
         st.divider()
@@ -2057,27 +2037,14 @@ if "result_df" in st.session_state:
             with ThreadPoolExecutor(max_workers=min(_rn, 6)) as _rex:
                 _rfuts = {_rex.submit(_rcalc_one, (_ri, _rbb)): _ri
                           for _ri, _rbb in enumerate(bb_list)}
-                _new_stats_r = [None] * _rn
                 for _rfut in as_completed(_rfuts):
-                    _ri, (_rvdf, _rcdf, _rsec, _rtotal, _rarea, _rlos) = _rfut.result()
+                    _ri, (_rvdf, _rcdf, _rsec, _) = _rfut.result()
                     _new_visible_r[_ri]    = _rvdf
                     _new_candidates_r[_ri] = _rcdf
                     _new_sectors_r[_ri]    = _rsec
-                    _new_stats_r[_ri]      = (_rtotal, _rarea, _rlos)
                     _rdone[0] += 1
                     _rprog.progress(_rdone[0] / _rn, text=f"{_rdone[0]}/{_rn} 面完了")
             _rprog.progress(1.0, text="再計算完了！")
-            # 診断情報を session_state に保存（rerun後も表示できるよう）
-            _diag_lines = [f"建物: {_orig_cnt}→{_filt_cnt}棟(除外{_orig_cnt-_filt_cnt}棟)"]
-            for _ri2, (_rbb2, _rvdf2, _rstat2) in enumerate(zip(bb_list, _new_visible_r, _new_stats_r)):
-                _sid2 = str(_rbb2.get("screen_id", _ri2))
-                _cnt2 = len(_rvdf2) if _rvdf2 is not None else -1
-                _t2, _a2, _l2 = _rstat2 if _rstat2 else (0, 0, 0)
-                _diag_lines.append(
-                    f"{_sid2}({_rbb2.get('facing_deg',0):.0f}°): "
-                    f"候補{_t2}→面積通過{_a2}→LOS除外{_l2}→可視{_cnt2}枚"
-                )
-            st.session_state["_recalc_diag"] = " ／ ".join(_diag_lines)
             st.session_state["result_df"] = (
                 pd.concat(_new_visible_r, ignore_index=True)
                 if any(not _v.empty for _v in _new_visible_r)
