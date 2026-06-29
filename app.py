@@ -344,12 +344,14 @@ def _gsi_reverse_geocode(lat: float, lon: float) -> Optional[str]:
     """国土地理院 逆ジオコーダー API で緯度経度 → 市区町村コード"""
     url = (f"https://mreversegeocoder.gsi.go.jp/reverse-geocoder/"
            f"LonLatToAddress?lat={lat}&lon={lon}")
-    try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = _json.loads(r.read())
-        return data["results"]["muniCd"]
-    except Exception:
-        return None
+    for _ in range(2):  # 最大2回試行
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = _json.loads(r.read())
+            return data["results"]["muniCd"]
+        except Exception:
+            pass
+    return None
 
 
 def _get_plateau_zip_url(dataset_id: str) -> Optional[str]:
@@ -483,16 +485,19 @@ def auto_fetch_citygml(billboards_df: pd.DataFrame,
         return None
     log(f"✅ カタログ取得完了（{len(catalog)} 市区町村がPlateau対応）")
 
-    # ② 逆ジオコーディング（並列）
+    # ② 逆ジオコーディング（並列・重複座標除去済み）
     log("📍 広告面板の市区町村を特定中...")
     muni_cds = set()
-    _bb_rows = [(row.latitude, row.longitude) for _, row in billboards_df.iterrows()]
-    with ThreadPoolExecutor(max_workers=min(len(_bb_rows), 8)) as _ex:
-        for muni_cd in _ex.map(lambda p: _gsi_reverse_geocode(*p), _bb_rows):
+    # 小数点3桁に丸めて重複を排除し、リクエスト数を削減
+    _unique_coords = list({(round(row.latitude, 3), round(row.longitude, 3))
+                           for _, row in billboards_df.iterrows()})
+    log(f"   {len(billboards_df)}面板 → {len(_unique_coords)}ユニーク座標でジオコーディング")
+    with ThreadPoolExecutor(max_workers=min(len(_unique_coords), 6)) as _ex:
+        for muni_cd in _ex.map(lambda p: _gsi_reverse_geocode(*p), _unique_coords):
             if muni_cd:
                 muni_cds.add(muni_cd)
     if not muni_cds:
-        log("❌ 市区町村コードを取得できませんでした（ネットワークを確認してください）")
+        log("❌ 市区町村コードを取得できませんでした（GSI APIへの接続を確認してください）")
         return None
     log(f"✅ 市区町村コード: {', '.join(sorted(muni_cds))}")
 
@@ -1792,7 +1797,7 @@ if "result_df" in st.session_state:
 
         # FIX ボタン
         if _manual_activated or _manual_deactivated:
-            _mc1, _mc2 = st.columns([3, 1])
+            _mc1, _mc2, _mc3 = st.columns([3, 1, 1])
             with _mc1:
                 _info_parts = []
                 if _manual_activated:
@@ -1800,6 +1805,11 @@ if "result_df" in st.session_state:
                 if _manual_deactivated:
                     _info_parts.append(f"取り消し: {len(_manual_deactivated)}件")
                 st.info(" ／ ".join(_info_parts))
+            with _mc3:
+                if st.button("🔄 リセット", key="manual_reset_btn"):
+                    st.session_state["manual_activated"]   = set()
+                    st.session_state["manual_deactivated"] = set()
+                    st.rerun()
             with _mc2:
                 if st.button("✅ FIX（手動補正を確定）", type="primary", key="manual_fix_btn"):
                     _new_av = list(all_visible)
