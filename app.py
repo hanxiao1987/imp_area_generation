@@ -631,7 +631,7 @@ def compute_visibility(bb: dict, buildings_gdf: Optional[gpd.GeoDataFrame]) -> t
     h         = bb["height_m"]
     facing    = bb["facing_deg"]
     radius    = bb.get("max_range_m", 500.0)
-    sid       = bb.get("screen_id", "B001")
+    sid       = bb.get("site_id", "B001")
 
     sector = create_sector(lat, lon, facing, radius)
     lat_sz, lon_sz = mesh10_cell_size()
@@ -842,7 +842,7 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
 
     for idx, (bb, sector, vdf) in enumerate(zip(billboards, sectors, visible_dfs)):
         color = COLORS[idx % len(COLORS)]
-        sid   = bb.get("screen_id", f"B{idx+1}")
+        sid   = bb.get("site_id", f"B{idx+1}")
 
         xs, ys = sector.exterior.xy
         fig.add_trace(go.Scattermapbox(
@@ -1109,7 +1109,7 @@ with st.sidebar:
 
     if bb_input_mode == "📂 CSVアップロード":
         st.markdown("""
-**必須列**: `screen_id`, `latitude`, `longitude`, `height_m`, `facing_deg`, `panel_h_mm`, `panel_w_mm`
+**必須列**: `site_id`, `latitude`, `longitude`, `height_m`, `facing_deg`, `panel_h_mm`, `panel_w_mm`
 
 最大視認距離は `panel_h_mm × panel_w_mm × 7 / 1,000,000` で自動計算されます（単位: mm）。
 """)
@@ -1137,7 +1137,7 @@ with st.sidebar:
                 )
             else:
                 st.session_state["manual_bb"] = {
-                    "screen_id":   sid_clean,
+                    "site_id":   sid_clean,
                     "latitude":    m_lat,
                     "longitude":   m_lon,
                     "height_m":    m_h,
@@ -1151,7 +1151,7 @@ with st.sidebar:
             manual_bb = st.session_state["manual_bb"]
             d = manual_bb
             st.success(
-                f"✅ **{d['screen_id']}** 設定済み  \n"
+                f"✅ **{d['site_id']}** 設定済み  \n"
                 f"緯度 {d['latitude']:.5f} / 経度 {d['longitude']:.5f}  \n"
                 f"高さ {d['height_m']}m｜方位 {d['facing_deg']}°  \n"
                 f"面サイズ {d['panel_h_mm']}×{d['panel_w_mm']}mm → 最大視認距離 {d['max_range_m']}m"
@@ -1230,8 +1230,8 @@ if (_csv_mode and bb_file is None) or (not _csv_mode and not manual_bb):
 # bb_df の構築
 if _csv_mode:
     try:
-        bb_df = pd.read_csv(bb_file, dtype={"screen_id": str})
-        required = {"screen_id", "latitude", "longitude", "height_m", "facing_deg",
+        bb_df = pd.read_csv(bb_file, dtype={"site_id": str})
+        required = {"site_id", "latitude", "longitude", "height_m", "facing_deg",
                     "panel_h_mm", "panel_w_mm"}
         missing  = required - set(bb_df.columns)
         if missing:
@@ -1254,7 +1254,7 @@ st.success(f"広告面板 {len(bb_df)} 件を読み込みました")
 st.dataframe(bb_df, use_container_width=True)
 
 # ── 位置補正用: corrected_coords 初期化 (入力データが変わったらリセット) ──────
-_src_sig = bb_df[["screen_id", "latitude", "longitude", "facing_deg"]].to_csv(index=False)
+_src_sig = bb_df[["site_id", "latitude", "longitude", "facing_deg"]].to_csv(index=False)
 if st.session_state.get("_corr_src") != _src_sig:
     st.session_state["_corr_src"] = _src_sig
     st.session_state["corrected_coords"] = {
@@ -1332,7 +1332,7 @@ for idx, row in bb_df_w.iterrows():
         prev_fig.add_trace(go.Scattermapbox(
             lat=list(ys), lon=list(xs), mode="lines", fill="toself",
             fillcolor="rgba(255,200,0,0.15)", line=dict(color=color, width=1.5),
-            name=f"{row.screen_id} 有効扇形" if pi == 0 else f"{row.screen_id} 有効扇形_{pi}",
+            name=f"{row.site_id} 有効扇形" if pi == 0 else f"{row.site_id} 有効扇形_{pi}",
             hoverinfo="skip",
         ))
     lat_sc, lon_sc = local_scale(row.latitude)
@@ -1341,17 +1341,17 @@ for idx, row in bb_df_w.iterrows():
     prev_fig.add_trace(go.Scattermapbox(
         lat=[row.latitude, arr_lat], lon=[row.longitude, arr_lon],
         mode="lines", line=dict(color=color, width=4),
-        name=f"{row.screen_id} 方向矢印", hoverinfo="skip",
+        name=f"{row.site_id} 方向矢印", hoverinfo="skip",
     ))
     prev_fig.add_trace(go.Scattermapbox(
         lat=[row.latitude], lon=[row.longitude], mode="markers",
         marker=dict(size=13, color=color),
-        name=str(row.screen_id),
-        hovertemplate=f"<b>{row.screen_id}</b><br>高さ: {row.height_m}m<br>方位: {row.facing_deg}°<extra></extra>",
+        name=str(row.site_id),
+        hovertemplate=f"<b>{row.site_id}</b><br>高さ: {row.height_m}m<br>方位: {row.facing_deg}°<extra></extra>",
     ))
 
 _prev_focus_opts = ["全表示"] + [
-    f"{str(row.screen_id)}  ({row.facing_deg}°)"
+    f"{str(row.site_id)}  ({row.facing_deg}°)"
     for _, row in bb_df_w.iterrows()
 ]
 _prev_focus_sel = st.selectbox(
@@ -1387,9 +1387,9 @@ st.subheader("✏️ 位置補正マップ")
 if not _FOLIUM_OK:
     st.warning("folium / streamlit-folium が未インストールです。`pip install folium streamlit-folium` を実行してください。")
 else:
-    # キー: 行インデックス文字列, ラベル: "screen_id (facing°)"
+    # キー: 行インデックス文字列, ラベル: "site_id (facing°)"
     _sel_opts = {
-        str(i): f"{str(r['screen_id'])}  ({float(r['facing_deg']):.0f}°)"
+        str(i): f"{str(r['site_id'])}  ({float(r['facing_deg']):.0f}°)"
         for i, r in bb_df_w.iterrows()
     }
 
@@ -1421,7 +1421,7 @@ else:
     )
     for _fi, _fr in bb_df_w.iterrows():
         _fi_key  = str(_fi)
-        _fsid    = str(_fr["screen_id"])
+        _fsid    = str(_fr["site_id"])
         _flat    = _corr[_fi_key]["latitude"]
         _flon    = _corr[_fi_key]["longitude"]
         _fcolor  = "red" if _fi_key == _sel else "blue"
@@ -1472,7 +1472,7 @@ else:
     with _cc_ctrl:
         _cur      = _corr[_sel]
         _orig_row = bb_df.loc[int(_sel)]          # 行インデックスで直接取得
-        _sel_sid  = str(_orig_row["screen_id"])   # 表示用 screen_id
+        _sel_sid  = str(_orig_row["site_id"])   # 表示用 site_id
         # 元データと比較して変更検知
         _cur_facing  = _cur.get("facing_deg", float(_orig_row["facing_deg"]))
         _orig_facing = float(_orig_row["facing_deg"])
@@ -1564,7 +1564,7 @@ else:
                     abs(_sp["longitude"] - float(_or["longitude"])) > 1e-7 or
                     abs(_spf - float(_or["facing_deg"])) > 0.05)
             st.caption(
-                f"{'✏️' if _mv else '📍'} **{str(_or['screen_id'])} ({float(_or['facing_deg']):.0f}°)**: "
+                f"{'✏️' if _mv else '📍'} **{str(_or['site_id'])} ({float(_or['facing_deg']):.0f}°)**: "
                 f"{_sp['latitude']:.5f}, {_sp['longitude']:.5f} / {_spf:.1f}°"
             )
 
@@ -1588,7 +1588,7 @@ with _fin_c1:
 
 if "finalized_master" in st.session_state:
     _fmdf = st.session_state["finalized_master"]
-    _out_cols = [c for c in ["screen_id", "latitude", "longitude", "height_m",
+    _out_cols = [c for c in ["site_id", "latitude", "longitude", "height_m",
                               "facing_deg", "panel_h_mm", "panel_w_mm"] if c in _fmdf.columns]
     with _fin_c2:
         _csv_out = _fmdf[_out_cols].to_csv(index=False).encode("utf-8-sig")
@@ -1660,7 +1660,7 @@ if "result_df" in st.session_state:
     for idx, (bb, vdf) in enumerate(zip(bb_list, all_visible)):
         with cols[idx % len(cols)]:
             st.metric(
-                label=str(bb["screen_id"]),
+                label=str(bb["site_id"]),
                 value=f"{len(vdf):,} メッシュ",
                 help=f"方位 {bb['facing_deg']}° / 高さ {bb['height_m']}m / 面 {bb.get('panel_h_mm','?')}×{bb.get('panel_w_mm','?')}mm / 最大視認距離 {bb.get('max_range_m','?')}m",
             )
@@ -1674,9 +1674,9 @@ if "result_df" in st.session_state:
 
     # ── 地図表示設定（フィルター + メッシュ色） ──────────────────────────
     with st.expander("🎛️ 地図表示設定", expanded=True):
-        # Screen_id フォーカスフィルター
+        # site_id フォーカスフィルター
         _focus_opts = ["全表示"] + [
-            f"{str(_bb['screen_id'])}  ({_bb['facing_deg']}°)"
+            f"{str(_bb['site_id'])}  ({_bb['facing_deg']}°)"
             for _bb in bb_list
         ]
         _focus_sel = st.selectbox(
@@ -1690,7 +1690,7 @@ if "result_df" in st.session_state:
         _show  = {}
         _mcols = {}
         for _i, _bb in enumerate(bb_list):
-            _s = str(_bb["screen_id"])
+            _s = str(_bb["site_id"])
             with _fcols[_i % min(_n_bb, 4)]:
                 _show[_i]  = st.checkbox(
                     f"表示: {_s}", value=True, key=f"show_{_i}"
@@ -1710,7 +1710,7 @@ if "result_df" in st.session_state:
         _focus_center = (_focus_bb["latitude"], _focus_bb["longitude"])
         _focus_zoom   = 18
 
-    # フィルタ適用（インデックスベースで重複 screen_id に対応）
+    # フィルタ適用（インデックスベースで重複 site_id に対応）
     _fbb  = [bb  for i, bb  in enumerate(bb_list)                          if _show.get(i, True)]
     _fvis = [vdf for i, (bb, vdf) in enumerate(zip(bb_list, all_visible)) if _show.get(i, True)]
     _fsec = [sec for i, (bb, sec) in enumerate(zip(bb_list, all_sectors)) if _show.get(i, True)]
@@ -1893,7 +1893,7 @@ if "result_df" in st.session_state:
 
             # ── フォーカスフィルター ──────────────────────────────────────────
             _excl_focus_opts = ["全表示"] + [
-                f"{str(_ebb['screen_id'])}  ({float(_ebb['facing_deg']):.0f}°)"
+                f"{str(_ebb['site_id'])}  ({float(_ebb['facing_deg']):.0f}°)"
                 for _ebb in bb_list
             ]
             _excl_focus_sel = st.selectbox(
@@ -1932,14 +1932,14 @@ if "result_df" in st.session_state:
                     folium.Polygon(
                         locations=[[p[1], p[0]] for p in _fpoly.exterior.coords],
                         color="gold", fill=True, fill_opacity=0.05, weight=1.5,
-                        tooltip=f"{_ebb['screen_id']} 扇形エリア",
+                        tooltip=f"{_ebb['site_id']} 扇形エリア",
                     ).add_to(_efm)
 
             # 面板マーカー
             for _ebb in bb_list:
                 folium.Marker(
                     location=[_ebb["latitude"], _ebb["longitude"]],
-                    tooltip=str(_ebb["screen_id"]),
+                    tooltip=str(_ebb["site_id"]),
                     icon=folium.Icon(color="orange", icon="flag"),
                 ).add_to(_efm)
 
@@ -2063,10 +2063,10 @@ if "result_df" in st.session_state:
     st.subheader("⬇️ メッシュコード CSV ダウンロード（Screen ID別）")
     st.caption("同一 Screen ID の複数向きを統合・重複除去・昇順ソート済み。ヘッダーなし。")
 
-    # screen_id ごとにメッシュコードを統合（重複除去・昇順ソート）
+    # site_id ごとにメッシュコードを統合（重複除去・昇順ソート）
     _sid_meshes: dict = {}
     for _bb, _vdf in zip(bb_list, all_visible):
-        _sid = str(_bb["screen_id"])
+        _sid = str(_bb["site_id"])
         if _vdf is not None and not _vdf.empty:
             _sid_meshes.setdefault(_sid, []).append(_vdf["mesh_code"])
 
