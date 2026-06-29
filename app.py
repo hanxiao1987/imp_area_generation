@@ -1034,7 +1034,7 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="広告視認エリア計算", page_icon="👁️", layout="wide")
+st.set_page_config(page_title="視認エリア解析システム", page_icon="👁️", layout="wide")
 
 # ── 扇形ドラッグ向き補正ハンドラ ────────────────────────────────────────────
 class _PolygonDrag(MacroElement):
@@ -1087,7 +1087,7 @@ def _check_password():
 _check_password()
 # ── 認証済みユーザーのみここから表示 ────────────────────────────────────────
 
-st.title("👁️ 広告面板 視認エリア計算アプリ")
+st.title("👁️ 広視認エリア解析システム")
 st.caption("Plateau CityGML × 10次メッシュ LOS 解析")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
