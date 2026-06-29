@@ -1022,8 +1022,13 @@ def build_map(billboards: list, sectors: list, visible_dfs: list,
     if focus_center:
         center_lat, center_lon = focus_center
     else:
-        center_lat = np.mean([bb["latitude"]  for bb in billboards])
-        center_lon = np.mean([bb["longitude"] for bb in billboards])
+        _lats = [bb["latitude"]  for bb in billboards]
+        _lons = [bb["longitude"] for bb in billboards]
+        center_lat = float(np.mean(_lats))
+        center_lon = float(np.mean(_lons))
+        if len(_lats) > 1:
+            _span = max(max(_lats) - min(_lats), max(_lons) - min(_lons), 1e-6)
+            focus_zoom = int(np.clip(np.log2(180 / _span), 4, 15))
     fig.update_layout(
         mapbox=dict(style="open-street-map",
                     center=dict(lat=center_lat, lon=center_lon), zoom=focus_zoom),
@@ -1373,7 +1378,12 @@ if _prev_focus_sel != "全表示":
 else:
     center_lat = bb_df_w["latitude"].mean()
     center_lon = bb_df_w["longitude"].mean()
-    _prev_zoom = 16
+    if len(bb_df_w) > 1:
+        _span = max(bb_df_w["latitude"].max()  - bb_df_w["latitude"].min(),
+                    bb_df_w["longitude"].max() - bb_df_w["longitude"].min(), 1e-6)
+        _prev_zoom = int(np.clip(np.log2(180 / _span), 4, 15))
+    else:
+        _prev_zoom = 16
 
 prev_fig.update_layout(
     mapbox=dict(style="open-street-map",
@@ -1797,7 +1807,7 @@ if "result_df" in st.session_state:
 
         # FIX ボタン
         if _manual_activated or _manual_deactivated:
-            _mc1, _mc2, _mc3 = st.columns([3, 1, 1])
+            _mc1, _mc2, _mc3, _mc4 = st.columns([3, 1, 1.2, 1])
             with _mc1:
                 _info_parts = []
                 if _manual_activated:
@@ -1805,11 +1815,29 @@ if "result_df" in st.session_state:
                 if _manual_deactivated:
                     _info_parts.append(f"取り消し: {len(_manual_deactivated)}件")
                 st.info(" ／ ".join(_info_parts))
-            with _mc3:
-                if st.button("🔄 リセット", key="manual_reset_btn"):
+            with _mc4:
+                if st.button("🔄 全リセット", key="manual_reset_btn"):
                     st.session_state["manual_activated"]   = set()
                     st.session_state["manual_deactivated"] = set()
                     st.rerun()
+            with _mc3:
+                if _focus_sel != "全表示":
+                    if st.button("↩️ この面のみリセット", key="manual_reset_one_btn"):
+                        _r_idx = _focus_opts.index(_focus_sel) - 1
+                        _r_codes_act   = set()
+                        _r_codes_deact = set()
+                        if all_candidates and _r_idx < len(all_candidates):
+                            _rcd = all_candidates[_r_idx]
+                            if _rcd is not None and not _rcd.empty:
+                                _r_codes_act = set(_rcd["mesh_code"].tolist())
+                        _r_av = st.session_state.get("all_visible", [])
+                        if _r_idx < len(_r_av) and _r_av[_r_idx] is not None and not _r_av[_r_idx].empty:
+                            _r_codes_deact = set(_r_av[_r_idx]["mesh_code"].tolist())
+                        _manual_activated   -= _r_codes_act
+                        _manual_deactivated -= _r_codes_deact
+                        st.session_state["manual_activated"]   = _manual_activated
+                        st.session_state["manual_deactivated"] = _manual_deactivated
+                        st.rerun()
             with _mc2:
                 if st.button("✅ FIX（手動補正を確定）", type="primary", key="manual_fix_btn"):
                     _new_av = list(all_visible)
