@@ -4,6 +4,7 @@ Plateau CityGML + 10次メッシュ LOS可視化
 """
 import io
 import math
+import hashlib
 import warnings
 import re
 import struct
@@ -99,6 +100,61 @@ def mesh10_cell_size() -> tuple:
     lat_sz = (2.0 / 3.0) / 8 / 10 / (2 ** 7)
     lon_sz = 1.0 / 8 / 10 / (2 ** 7)
     return lat_sz, lon_sz
+
+
+def decode_mesh10(code: str) -> tuple:
+    """メッシュコード（15桁）→ (center_lat, center_lon, lat_sz, lon_sz)"""
+    p  = int(code[0:2])
+    q  = int(code[2:4])
+    lat = p / 1.5
+    lon = float(q + 100)
+    lat_sz = 2.0 / 3.0
+    lon_sz = 1.0
+    lat_sz /= 8;  lon_sz /= 8
+    lat += int(code[4]) * lat_sz;  lon += int(code[5]) * lon_sz
+    lat_sz /= 10; lon_sz /= 10
+    lat += int(code[6]) * lat_sz;  lon += int(code[7]) * lon_sz
+    for i in range(7):
+        lat_sz /= 2; lon_sz /= 2
+        d = int(code[8 + i])
+        if d in (3, 4): lat += lat_sz
+        if d in (2, 4): lon += lon_sz
+    return lat + lat_sz / 2, lon + lon_sz / 2, lat_sz, lon_sz
+
+
+def reconstruct_from_meshes(bb_list: list, sid_to_meshes: dict) -> tuple:
+    """
+    メッシュコードリストから all_visible と all_sectors を再構築する。
+    建物データ不要。area_ratio は 1.0 固定。
+    """
+    all_visible: list = []
+    all_sectors: list = []
+    for bb in bb_list:
+        sid    = str(bb["site_id"])
+        lat    = float(bb["latitude"])
+        lon    = float(bb["longitude"])
+        facing = float(bb["facing_deg"])
+        max_r  = float(bb.get("max_range_m", 500.0))
+        lat_sc, lon_sc = local_scale(lat)
+        all_sectors.append(create_sector(lat, lon, facing, max_r))
+        rows = []
+        for code in sid_to_meshes.get(sid, []):
+            try:
+                clat, clon, _, _ = decode_mesh10(code)
+            except Exception:
+                continue
+            dx_m = (clon - lon) * lon_sc
+            dy_m = (clat - lat) * lat_sc
+            rows.append({
+                "billboard_id": sid,
+                "mesh_code":    code,
+                "center_lat":   round(clat, 8),
+                "center_lon":   round(clon, 8),
+                "distance_m":   round(math.sqrt(dx_m ** 2 + dy_m ** 2), 1),
+                "area_ratio":   1.0,
+            })
+        all_visible.append(pd.DataFrame(rows) if rows else pd.DataFrame())
+    return all_visible, all_sectors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1169,38 +1225,55 @@ with st.sidebar:
 
     st.divider()
 
-    # ② 建物データ
-    st.subheader("② 建物データ（CityGML）")
-    bldg_mode = st.radio(
-        "取得方法",
-        ["🚀 Plateau から自動取得", "📂 手動アップロード", "⛔ 使用しない"],
-        help=(
-            "自動取得: 広告面板の位置から必要な建物データをネット経由で自動ダウンロード\n"
-            "手動: .gml ファイルをアップロード\n"
-            "使用しない: 建物遮蔽なし（扇形全体を視認エリアとして計算）"
-        ),
+    # 🔄 前回メッシュを再利用
+    st.subheader("🔄 前回メッシュを再利用（任意）")
+    st.caption(
+        "前回ダウンロードしたメッシュZIPをアップロードすると、"
+        "建物データ取得・計算をスキップして直接結果を表示します。"
+    )
+    reuse_zip = st.file_uploader(
+        "メッシュコードZIP", type=["zip"], key="reuse_zip",
+        help="「全 Screen ID を一括ダウンロード」で取得した ZIP ファイルをアップロードしてください。",
     )
 
     gml_file  = None
     fetch_btn = False
+    bldg_mode = "⛔ 使用しない"
 
-    if bldg_mode == "📂 手動アップロード":
-        gml_file = st.file_uploader(
-            "CityGML (.gml) をアップロード", type=["gml", "xml"], key="gml"
+    if reuse_zip is None:
+        st.divider()
+
+        # ② 建物データ
+        st.subheader("② 建物データ（CityGML）")
+        bldg_mode = st.radio(
+            "取得方法",
+            ["🚀 Plateau から自動取得", "📂 手動アップロード", "⛔ 使用しない"],
+            help=(
+                "自動取得: 広告面板の位置から必要な建物データをネット経由で自動ダウンロード\n"
+                "手動: .gml ファイルをアップロード\n"
+                "使用しない: 建物遮蔽なし（扇形全体を視認エリアとして計算）"
+            ),
         )
-    elif bldg_mode == "🚀 Plateau から自動取得":
-        st.caption(
-            "広告面板 CSV をアップロード後、ボタンで Plateau の建物データを自動ダウンロードします。"
-            "インターネット接続が必要です。"
-        )
-        fetch_btn = st.button(
-            "🏢 建物データを自動取得",
-            disabled=(bb_file is None and not manual_bb),
-            use_container_width=True,
-            type="secondary",
-        )
+
+        if bldg_mode == "📂 手動アップロード":
+            gml_file = st.file_uploader(
+                "CityGML (.gml) をアップロード", type=["gml", "xml"], key="gml"
+            )
+        elif bldg_mode == "🚀 Plateau から自動取得":
+            st.caption(
+                "広告面板 CSV をアップロード後、ボタンで Plateau の建物データを自動ダウンロードします。"
+                "インターネット接続が必要です。"
+            )
+            fetch_btn = st.button(
+                "🏢 建物データを自動取得",
+                disabled=(bb_file is None and not manual_bb),
+                use_container_width=True,
+                type="secondary",
+            )
+        else:
+            st.caption("建物遮蔽なしで計算します。扇形内のメッシュすべてが有効になります。")
     else:
-        st.caption("建物遮蔽なしで計算します。扇形内のメッシュすべてが有効になります。")
+        st.success("🔄 再利用モード有効: 建物データ取得・計算をスキップします。")
 
     st.divider()
 
@@ -1223,10 +1296,13 @@ with st.sidebar:
 
     st.divider()
     _has_input = (bb_file is not None) or bool(manual_bb)
-    run_btn = st.button(
-        "▶ 計算実行", type="primary", use_container_width=True,
-        disabled=not _has_input,
-    )
+    if reuse_zip is None:
+        run_btn = st.button(
+            "▶ 計算実行", type="primary", use_container_width=True,
+            disabled=not _has_input,
+        )
+    else:
+        run_btn = False
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -1288,6 +1364,59 @@ for _ci, _cr in bb_df_w.iterrows():
         bb_df_w.at[_ci, "longitude"]  = _corr[_ckey]["longitude"]
         bb_df_w.at[_ci, "facing_deg"] = int(_corr[_ckey].get("facing_deg", _cr["facing_deg"]))
 bb_df_w["max_range_m"] = (bb_df_w["panel_h_mm"] / 1000 * bb_df_w["panel_w_mm"] / 1000 * 7).round(1)
+
+# ── メッシュ再利用モード ──────────────────────────────────────────────────────
+_reuse_mode = reuse_zip is not None
+
+if _reuse_mode:
+    _zip_bytes   = reuse_zip.getvalue()
+    _reuse_hash  = hashlib.md5(
+        _zip_bytes + bb_df_w.to_csv(index=False).encode()
+    ).hexdigest()
+
+    if st.session_state.get("reuse_zip_hash") != _reuse_hash:
+        # ZIP を解析してメッシュコードを取得
+        _sid_meshes: dict = {}
+        try:
+            with zipfile.ZipFile(io.BytesIO(_zip_bytes)) as _rzf:
+                for _rfname in _rzf.namelist():
+                    _rm = re.match(r"No\.(.+)\.csv$", _rfname)
+                    if _rm:
+                        _rsid = _rm.group(1)
+                        _rcontent = _rzf.read(_rfname).decode("utf-8")
+                        _sid_meshes[_rsid] = [
+                            ln.strip() for ln in _rcontent.splitlines() if ln.strip()
+                        ]
+        except Exception as _re:
+            st.error(f"ZIPの解析に失敗しました: {_re}")
+            st.stop()
+
+        _bb_recs = bb_df_w.to_dict("records")
+        _av, _as  = reconstruct_from_meshes(_bb_recs, _sid_meshes)
+        _rdf = (
+            pd.concat(_av, ignore_index=True)
+            if any(not v.empty for v in _av) else pd.DataFrame()
+        )
+        _total_meshes = sum(len(v) for v in _av if not v.empty)
+        st.session_state["result_df"]       = _rdf
+        st.session_state["all_visible"]     = _av
+        st.session_state["all_sectors"]     = _as
+        st.session_state["all_candidates"]  = None
+        st.session_state["bb_list"]         = _bb_recs
+        st.session_state["buildings_calc"]  = None
+        st.session_state["buildings_orig"]  = None
+        st.session_state["reuse_zip_hash"]  = _reuse_hash
+        st.session_state.pop("excl_applied",       None)
+        st.session_state.pop("manual_activated",   None)
+        st.session_state.pop("manual_deactivated", None)
+        st.success(f"🔄 メッシュを再構築しました（合計 {_total_meshes:,} メッシュ）")
+        st.rerun()
+    else:
+        _total_meshes = sum(
+            len(v) for v in st.session_state.get("all_visible", [])
+            if v is not None and not v.empty
+        )
+        st.info(f"🔄 再利用メッシュ読み込み済み（合計 {_total_meshes:,} メッシュ）")
 
 # 建物データ（手動アップロード）
 if gml_file is not None:
@@ -1617,7 +1746,7 @@ if "finalized_master" in st.session_state:
     st.dataframe(_fmdf[_out_cols], use_container_width=True)
 
 # ── 計算実行 ─────────────────────────────────────────────────────────────────
-if run_btn:
+if not _reuse_mode and run_btn:
     _n_bb     = len(bb_df_w)
     prog_bar  = st.progress(0, text="計算を開始しています...")
     all_visible    = [None] * _n_bb
