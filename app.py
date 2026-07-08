@@ -1887,10 +1887,15 @@ if "result_df" in st.session_state:
     else:
         _has_cands = False
 
-    if _has_cands or _manual_activated or _manual_deactivated:
+    _has_visible = any(v is not None and not v.empty for v in all_visible)
+
+    if _has_cands or _manual_activated or _manual_deactivated or _has_visible:
         st.divider()
         st.subheader("✏️ 手動メッシュ補正")
-        st.caption("自動メッシュをクリックで取り消し（グレー）→再クリックで復元。緑の候補メッシュをクリックで追加。FIX で確定。")
+        if _has_cands:
+            st.caption("自動メッシュをクリックで取り消し（グレー）→再クリックで復元。緑の候補メッシュをクリックで追加。FIX で確定。")
+        else:
+            st.caption("自動メッシュをクリックで取り消し（グレー）→再クリックで復元。FIX で確定。")
 
         # インタラクティブマップ（候補 + 有効化済みを表示）
         with st.spinner("マップ生成中..."):
