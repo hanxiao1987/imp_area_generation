@@ -124,28 +124,45 @@ def decode_mesh10(code: str) -> tuple:
 
 def reconstruct_from_meshes(bb_list: list, sid_to_meshes: dict) -> tuple:
     """
-    メッシュコードリストから all_visible と all_sectors を再構築する。
-    建物データ不要。area_ratio は 1.0 固定。
+    メッシュコードリストから all_visible / all_candidates / all_sectors を再構築する。
+    候補メッシュ = 有効扇形内のメッシュ（1%以上のオーバーラップ）のうち、
+    アップロード済み可視メッシュに含まれないもの。
     """
-    all_visible: list = []
-    all_sectors: list = []
+    all_visible:    list = []
+    all_sectors:    list = []
+    all_candidates: list = []
+    lat_sz, lon_sz = mesh10_cell_size()
+    mesh_area = lat_sz * lon_sz
+
     for bb in bb_list:
         sid    = str(bb["site_id"])
         lat    = float(bb["latitude"])
         lon    = float(bb["longitude"])
+        h      = float(bb.get("height_m", 0.0))
         facing = float(bb["facing_deg"])
         max_r  = float(bb.get("max_range_m", 500.0))
         lat_sc, lon_sc = local_scale(lat)
-        all_sectors.append(create_sector(lat, lon, facing, max_r))
-        rows = []
-        for code in sid_to_meshes.get(sid, []):
+
+        sector = create_sector(lat, lon, facing, max_r)
+        all_sectors.append(sector)
+
+        # デッドゾーン除外
+        dead_r_deg = h / ((lat_sc + lon_sc) / 2) if h > 0 else 0.0
+        eff_sector = sector.difference(Point(lon, lat).buffer(dead_r_deg)) if dead_r_deg > 0 else sector
+
+        # アップロード済み可視メッシュ
+        visible_codes = set(sid_to_meshes.get(sid, []))
+
+        # visible rows
+        vis_rows = []
+        for code in visible_codes:
             try:
                 clat, clon, _, _ = decode_mesh10(code)
             except Exception:
                 continue
             dx_m = (clon - lon) * lon_sc
             dy_m = (clat - lat) * lat_sc
-            rows.append({
+            vis_rows.append({
                 "billboard_id": sid,
                 "mesh_code":    code,
                 "center_lat":   round(clat, 8),
@@ -153,8 +170,39 @@ def reconstruct_from_meshes(bb_list: list, sid_to_meshes: dict) -> tuple:
                 "distance_m":   round(math.sqrt(dx_m ** 2 + dy_m ** 2), 1),
                 "area_ratio":   1.0,
             })
-        all_visible.append(pd.DataFrame(rows) if rows else pd.DataFrame())
-    return all_visible, all_sectors
+        all_visible.append(pd.DataFrame(vis_rows) if vis_rows else pd.DataFrame())
+
+        # candidate rows: 有効扇形内のメッシュのうち visible にないもの
+        cand_rows = []
+        if not eff_sector.is_empty:
+            minlon_, minlat_, maxlon_, maxlat_ = eff_sector.bounds
+            _lats = np.arange(math.floor(minlat_ / lat_sz) * lat_sz, maxlat_ + lat_sz, lat_sz)
+            _lons = np.arange(math.floor(minlon_ / lon_sz) * lon_sz, maxlon_ + lon_sz, lon_sz)
+            for _la in _lats:
+                for _lo in _lons:
+                    _mbox = box(_lo, _la, _lo + lon_sz, _la + lat_sz)
+                    if not eff_sector.intersects(_mbox):
+                        continue
+                    inter = eff_sector.intersection(_mbox)
+                    if inter.is_empty or inter.area / mesh_area < 0.01:
+                        continue
+                    _code = encode_mesh10(_la + lat_sz / 2, _lo + lon_sz / 2)
+                    if _code in visible_codes:
+                        continue
+                    clat_, clon_ = _la + lat_sz / 2, _lo + lon_sz / 2
+                    dx_m = (clon_ - lon) * lon_sc
+                    dy_m = (clat_ - lat) * lat_sc
+                    cand_rows.append({
+                        "billboard_id": sid,
+                        "mesh_code":    _code,
+                        "center_lat":   round(clat_, 8),
+                        "center_lon":   round(clon_, 8),
+                        "distance_m":   round(math.sqrt(dx_m ** 2 + dy_m ** 2), 1),
+                        "area_ratio":   round(inter.area / mesh_area, 3),
+                    })
+        all_candidates.append(pd.DataFrame(cand_rows) if cand_rows else pd.DataFrame())
+
+    return all_visible, all_sectors, all_candidates
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1392,7 +1440,7 @@ if _reuse_mode:
             st.stop()
 
         _bb_recs = bb_df_w.to_dict("records")
-        _av, _as  = reconstruct_from_meshes(_bb_recs, _sid_meshes)
+        _av, _as, _ac = reconstruct_from_meshes(_bb_recs, _sid_meshes)
         _rdf = (
             pd.concat(_av, ignore_index=True)
             if any(not v.empty for v in _av) else pd.DataFrame()
@@ -1401,7 +1449,7 @@ if _reuse_mode:
         st.session_state["result_df"]       = _rdf
         st.session_state["all_visible"]     = _av
         st.session_state["all_sectors"]     = _as
-        st.session_state["all_candidates"]  = None
+        st.session_state["all_candidates"]  = _ac
         st.session_state["bb_list"]         = _bb_recs
         st.session_state["buildings_calc"]  = None
         st.session_state["buildings_orig"]  = None
