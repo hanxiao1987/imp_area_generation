@@ -1201,7 +1201,7 @@ def _check_password():
 _check_password()
 # ── 認証済みユーザーのみここから表示 ────────────────────────────────────────
 
-st.title("👁️ 広視認エリア解析システム")
+st.title("👁️ 視認エリア解析システム")
 st.caption("Plateau CityGML × 10次メッシュ LOS 解析")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -1229,9 +1229,9 @@ with st.sidebar:
 """)
         bb_file = st.file_uploader("CSVをアップロード", type=["csv"], key="bb_csv")
     else:
-        st.caption("最大1面の情報を入力してください。Screen IDは6桁の番号（例: 000001）にしてください。")
+        st.caption("最大1面の情報を入力してください。Site IDは6桁の番号（例: 000001）にしてください。")
         with st.form("manual_bb_form"):
-            sid_raw = st.text_input("Screen ID（6桁）", placeholder="例: 000001")
+            sid_raw = st.text_input("Site ID（6桁）", placeholder="例: 000001")
             m_lat   = st.number_input("緯度 latitude",           value=35.6812,  format="%.6f")
             m_lon   = st.number_input("経度 longitude",          value=139.7671, format="%.6f")
             m_h     = st.number_input("高さ height_m (m)",       value=10.0,  min_value=0.1,  step=0.5)
@@ -1243,10 +1243,10 @@ with st.sidebar:
         if submitted:
             sid_clean = str(sid_raw).strip()
             if len(sid_clean) == 0:
-                st.warning("⚠️ Screen IDを入力してください。")
+                st.warning("⚠️ Site IDを入力してください。")
             elif len(sid_clean) < 6:
                 st.warning(
-                    f"⚠️ Screen IDは6桁にしてください。"
+                    f"⚠️ Site IDは6桁にしてください。"
                     f"「**{sid_clean.zfill(6)}**」のように頭に0を付けて入力してください。"
                 )
             else:
@@ -1281,7 +1281,7 @@ with st.sidebar:
     )
     reuse_zip = st.file_uploader(
         "メッシュコードZIP", type=["zip"], key="reuse_zip",
-        help="「全 Screen ID を一括ダウンロード」で取得した ZIP ファイルをアップロードしてください。",
+        help="「全 Site ID を一括ダウンロード」で取得した ZIP ファイルをアップロードしてください。",
     )
 
     gml_file  = None
@@ -2280,8 +2280,8 @@ if "result_df" in st.session_state:
 
     # ── メッシュコード CSV ダウンロード ───────────────────────────────────────
     st.divider()
-    st.subheader("⬇️ メッシュコード CSV ダウンロード（Screen ID別）")
-    st.caption("同一 Screen ID の複数向きを統合・重複除去・昇順ソート済み。ヘッダーなし。")
+    st.subheader("⬇️ メッシュコード CSV ダウンロード（Site ID別）")
+    st.caption("同一 Site ID の複数向きを統合・重複除去・昇順ソート済み。ヘッダーなし。")
 
     # site_id ごとにメッシュコードを統合（重複除去・昇順ソート）
     _sid_meshes: dict = {}
@@ -2326,7 +2326,7 @@ if "result_df" in st.session_state:
                 )
         _zip_buf.seek(0)
         st.download_button(
-            label="⬇️ 全 Screen ID を一括ダウンロード (ZIP)",
+            label="⬇️ 全 Site ID を一括ダウンロード (ZIP)",
             data=_zip_buf.getvalue(),
             file_name="mesh_codes_all.zip",
             mime="application/zip",
