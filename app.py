@@ -1198,7 +1198,8 @@ def _check_password():
             st.error("パスワードが違います。")
     st.stop()
 
-_check_password()
+# TODO: secrets の設定経路が決まったら復帰させる（一時的に認証を無効化）
+# _check_password()
 # ── 認証済みユーザーのみここから表示 ────────────────────────────────────────
 
 st.title("👁️ 視認エリア解析システム")
